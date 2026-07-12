@@ -63,7 +63,8 @@ class ModelManager:
     def __init__(self, ckptdir: str):
         self.ckptdir = ckptdir
         self._loaded: Optional[LoadedModel] = None
-        self._streamer: Optional[LayerStreamer] = None
+        self._streamer = None      # legacy layer-streamer (unused for MoE now)
+        self._offloader = None     # ExpertOffloader for MoE (routed experts on CPU)
         self._lock = threading.RLock()  # serializes load/unload/generate
         self._reaper = threading.Thread(target=self._idle_watch, daemon=True)
         self._reaper.start()
@@ -176,41 +177,21 @@ class ModelManager:
 
         if device == "mp" and torch.cuda.device_count() >= 2:
             if expert_offload and spec.moe:
-                # FP8 + device_map with CPU is rejected by transformers, so we
-                # load the whole model to CPU and stream decoder layers onto a
-                # single GPU a chunk at a time (double-buffered, like the user's
-                # iter_forward_gpu_buff). The shared rotary_emb + KV cache pin
-                # us to ONE gpu; both cards are exercised via parallel instances
-                # in the bench instead.
+                # MoE (30B): the FP8 checkpoint is ALREADY quantized, so we must
+                # NOT route it through device_map with CPU entries — transformers
+                # would try to "convert" the FP8 weights and fail. Load the whole
+                # model straight onto ONE gpu with device_map={"":gpu}, then move
+                # ONLY the routed-expert weight tensors (27 GB of 31) to CPU and
+                # page them per forward via ExpertOffloader. Resident GPU footprint
+                # drops to ~2 GB (attention+router+shared+embed), experts page in.
+                from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
+                gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map="cpu",
+                    path, torch_dtype="auto", device_map={"": gpu_id},
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                # For inference we don't need the MoE load-balancing aux loss, and
-                # collecting router_logits through the streaming forward is fiddly
-                # (layers return a bare hidden Tensor when use_cache=False). Turn
-                # the flag off so Qwen3MoeForCausalLM.forward doesn't read
-                # outputs.router_logits.
-                if hasattr(model.config, "output_router_logits"):
-                    model.config.output_router_logits = False
-                    print("[manager] set config.output_router_logits=False", flush=True)
-                # generation_config may also carry the flag — disable there too.
-                gc = getattr(model, "generation_config", None)
-                if gc is not None and hasattr(gc, "output_router_logits"):
-                    gc.output_router_logits = False
-                gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
-                self._streamer = LayerStreamer(
-                    model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
-                self._streamer.install()
-                # lm_head lives on the ForCausalLM wrapper, not model.model —
-                # move it to the streamer's GPU so logits match the last layer.
-                if hasattr(model, "lm_head") and model.lm_head is not None:
-                    try:
-                        model.lm_head.to(f"cuda:{gpu_id}")
-                    except Exception:
-                        pass
-                placement = {"mode": "layer_stream", "gpu": gpu_id,
-                             "chunk": self._STREAM_CHUNK,
+                self._offloader = ExpertOffloader.install(model, gpu_id=gpu_id)
+                placement = {"mode": "expert_offload", "gpu": gpu_id,
                              "n_layers": len(model.model.layers)}
                 device = "mp_cpu_offload"
             else:
@@ -232,21 +213,19 @@ class ModelManager:
             # single GPU (cuda:<id>) — for MoE we still need offload to fit.
             gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
             if expert_offload and spec.moe:
+                from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map="cpu",
+                    path, torch_dtype="auto", device_map={"": gpu_id},
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                self._streamer = LayerStreamer(
-                    model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
-                self._streamer.install()
-                placement = {"mode": "layer_stream", "gpu": gpu_id,
-                             "chunk": self._STREAM_CHUNK}
+                self._offloader = ExpertOffloader.install(model, gpu_id=gpu_id)
+                placement = {"mode": "expert_offload", "gpu": gpu_id}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map="cpu",
+                    path, torch_dtype="auto", device_map={"": gpu_id},
                     local_files_only=True, attn_implementation=attn,
-                ).eval().to(f"cuda:{gpu_id}")
+                ).eval()
                 placement = {f"cuda:{gpu_id}": "all"}
 
         info = ModelInfo.from_model(model)
@@ -264,7 +243,15 @@ class ModelManager:
     def _do_unload(self):
         lm = self._loaded
         print(f"[manager] unloading {lm.spec.id} (device={lm.device})", flush=True)
-        # Detach the layer streamer hooks first (if any).
+        # Detach the expert offloader hooks first (restores experts to GPU so
+        # the subsequent model.to('cpu') can move them cleanly).
+        if self._offloader is not None:
+            try:
+                self._offloader.remove()
+            except Exception:
+                pass
+            self._offloader = None
+        # Detach the legacy layer streamer hooks (if any).
         if self._streamer is not None:
             try:
                 self._streamer.remove()
