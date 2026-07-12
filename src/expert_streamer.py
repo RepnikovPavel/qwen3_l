@@ -37,6 +37,17 @@ class ExpertOffloader:
         self._handles: list = []
         self._installed = False
         self._home_gpu: dict[int, int] = {}
+        # ---- LRU cache of resident experts on the GPU ----
+        # Don't evict immediately — keep recently-used expert modules on the GPU
+        # so repeated decode steps (which hit the same experts) don't re-copy.
+        # Capacity in MiB; defaults to leaving ~10 GiB free after the resident
+        # non-expert weights. Override via DEMO_EXPERT_CACHE_GIB.
+        import os  # noqa: PLC0415
+        self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "10"))
+        self._cache_used_bytes = 0
+        self._cache_order: list[int] = []  # module ids in LRU order (front=MRU)
+        self._on_gpu: set[int] = set()
+        self._module_size: dict[int, int] = {}  # module id -> bytes of experts
 
     @classmethod
     def install(cls, model: nn.Module) -> "ExpertOffloader":
@@ -113,13 +124,26 @@ class ExpertOffloader:
             self._home_gpu[idx] = home_gpu
             # Move everything in this layer to the home GPU first...
             layer.to(home)
-            # ...then push the routed-expert tensors back to CPU.
+            # ...then push the routed-expert tensors back to CPU (PINNED, so the
+            # later CPU->GPU copies use DMA instead of staging through pageable
+            # memory — ~2-3x faster).
             mlp = getattr(layer, "mlp", None)
             experts = getattr(mlp, "experts", None) if mlp is not None else None
             if experts is not None and hasattr(experts, "gate_up_proj"):
+                mod_bytes = 0
                 for p in experts.parameters():
                     total_offloaded += p.numel() * p.element_size()
+                    mod_bytes += p.numel() * p.element_size()
+                    # Move to CPU then wrap in pinned storage for fast DMA.
                     p.data = p.data.to("cpu", non_blocking=False)
+                    try:
+                        p.data = torch.empty(
+                            p.data.shape, dtype=p.data.dtype,
+                            device="cpu", pin_memory=True,
+                        ).copy_(p.data)
+                    except RuntimeError:
+                        pass  # host OOM on pin — fall back to pageable
+                self._module_size[id(experts)] = mod_bytes
                 # Install paging hooks on this experts module.
                 pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
                 post = experts.register_forward_hook(self._make_post_hook())
@@ -129,16 +153,64 @@ class ExpertOffloader:
 
         torch.cuda.synchronize(home)
         self._installed = True
+        cap_mib = self._cache_gib * 1024
+        n_fit = int(cap_mib // (min(self._module_size.values()) / 1024**2)) if self._module_size else 0
         print(f"[expert-offload] placed {n_layers} layers on {home}; "
               f"{total_offloaded/1024**3:.2f} GiB of routed experts on CPU "
-              f"(paged per forward)", flush=True)
+              f"(pinned, DMA copy). GPU cache: {cap_mib:.0f} MiB "
+              f"(~{n_fit} expert modules stay resident after warmup)", flush=True)
+
+    def _touch(self, mod_id: int):
+        """Mark a module as most-recently-used in the LRU order."""
+        if mod_id in self._cache_order:
+            self._cache_order.remove(mod_id)
+        self._cache_order.append(mod_id)
+
+    def _evict_until_fits(self, need_bytes: int):
+        """Evict least-recently-used expert modules until `need_bytes` free in cache."""
+        cap = self._cache_gib * 1024**3
+        while self._cache_used_bytes + need_bytes > cap and self._cache_order:
+            victim = self._cache_order.pop(0)  # LRU
+            # Find the module object by id (linear scan over the expert modules).
+            for experts in self._iter_expert_modules():
+                if id(experts) == victim:
+                    sz = self._module_size.get(victim, 0)
+                    for p in experts.parameters():
+                        if p.device.type == "cuda":
+                            # Copy back to (pinned) CPU and free the GPU copy.
+                            cpu = torch.empty(
+                                p.data.shape, dtype=p.data.dtype,
+                                device="cpu", pin_memory=True,
+                            )
+                            cpu.copy_(p.data)
+                            p.data = cpu
+                    self._cache_used_bytes -= sz
+                    self._on_gpu.discard(victim)
+                    break
 
     def _make_pre_hook(self, home: str):
-        """Page the expert tensors onto their home GPU before the module runs."""
+        """Page the expert tensors onto their home GPU before the module runs.
+
+        LRU-cached: if already resident (cache hit) just bump the order; else
+        evict LRU victims to make room and copy this module in (pinned DMA).
+        """
         def hook(_module, args):
-            for p in _module.parameters():
-                if p.device.type == "cpu":
-                    p.data = p.data.to(home, non_blocking=False)
+            mod_id = id(_module)
+            if mod_id in self._on_gpu:
+                # Cache hit — no copy at all.
+                self._touch(mod_id)
+            else:
+                sz = self._module_size.get(mod_id, 0)
+                self._evict_until_fits(sz)
+                for p in _module.parameters():
+                    if p.device.type == "cpu":
+                        # pinned->cuda with non_blocking overlaps with compute
+                        # issued later; we still need a sync before the expert
+                        # matmul reads it, but the DMA itself is fast.
+                        p.data = p.data.to(home, non_blocking=False)
+                self._on_gpu.add(mod_id)
+                self._cache_used_bytes += sz
+                self._touch(mod_id)
             new_args = []
             for a in args:
                 if isinstance(a, torch.Tensor) and str(a.device) != home:
@@ -149,11 +221,14 @@ class ExpertOffloader:
         return hook
 
     def _make_post_hook(self):
-        """Page expert tensors back to CPU after use."""
+        """No immediate eviction — keep experts resident in the LRU cache.
+
+        The cache is bounded by DEMO_EXPERT_CACHE_GIB; eviction happens lazily
+        in _make_pre_hook when a new module needs room. For a decode loop that
+        re-uses the same experts every token, this turns 48 copies/token into
+        ~0 copies/token after warmup.
+        """
         def hook(_module, _args, output):
-            for p in _module.parameters():
-                if p.device.type == "cuda":
-                    p.data = p.data.to("cpu", non_blocking=False)
             return output
 
         return hook
