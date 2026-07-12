@@ -79,12 +79,15 @@ class ExpertOffloader:
         import os  # noqa: PLC0415
 
         n_gpus = torch.cuda.device_count() or 1
-        # Decide a home GPU for each layer: round-robin across GPUs.
-        # The non-expert parts (attn/router/shared/norm) of that layer move
-        # there; the routed experts stay on CPU and page to the home GPU.
+        # Decide a home GPU for each layer: split in CONTIGUOUS halves
+        # (layers 0..N/2-1 on gpu0, N/2..N-1 on gpu1) — minimizes cross-GPU
+        # boundary crossings vs round-robin, and matches what device_map="auto"
+        # would do. The non-expert parts move to the home GPU; routed experts
+        # stay on CPU and page to it.
         inner = getattr(self.model, "model", self.model)
         layers = list(getattr(inner, "layers", []))
         n_layers = len(layers)
+        split = (n_layers + n_gpus - 1) // n_gpus  # ceil — first half slightly bigger
 
         # Entry modules (embed_tokens) on GPU 0.
         if hasattr(inner, "embed_tokens") and inner.embed_tokens is not None:
@@ -105,7 +108,7 @@ class ExpertOffloader:
 
         total_offloaded = 0
         for idx, layer in enumerate(layers):
-            gpu = idx % n_gpus
+            gpu = min(idx // split, n_gpus - 1)
             home = f"cuda:{gpu}"
             self._home_gpu[idx] = gpu
             # Move everything in this layer to the home GPU first...
@@ -123,9 +126,10 @@ class ExpertOffloader:
                 self._handles.append(pre)
                 self._handles.append(post)
             # Install a pre-hook on the whole layer to bridge activations onto
-            # its home GPU (needed because the previous layer may be on a
-            # different GPU in the round-robin).
-            layer.register_forward_pre_hook(self._make_layer_bridge(home))
+            # its home GPU (needed at the GPU0/GPU1 boundary; also moves the
+            # rotary cos/sin kwarg along with the activation).
+            layer.register_forward_pre_hook(self._make_layer_bridge(home),
+                                            with_kwargs=True)
 
         for g in range(n_gpus):
             torch.cuda.synchronize(f"cuda:{g}")
@@ -162,17 +166,21 @@ class ExpertOffloader:
     def _make_layer_bridge(self, home: str):
         """Layer pre-hook: move incoming activations onto this layer's home GPU.
 
-        With round-robin placement, the previous layer may live on a different
-        GPU, so hidden_states arrive on the wrong device. This bridges them.
+        With contiguous-half placement, only the boundary layer (first of the
+        second half) actually hops GPUs; others are no-ops. We move args AND
+        kwargs (position_embeddings = rotary cos/sin lives in kwargs and is
+        shared, so it must hop with the activation).
         """
-        def hook(_layer, args):
-            new_args = []
-            for a in args:
-                if isinstance(a, torch.Tensor) and a.device.type == "cuda" \
-                        and str(a.device) != home:
-                    a = a.to(home, non_blocking=True)
-                new_args.append(a)
-            return tuple(new_args)
+        def hook(_layer, args, kwargs):
+            def _mv(x):
+                if isinstance(x, torch.Tensor) and x.device.type == "cuda" \
+                        and str(x.device) != home:
+                    return x.to(home, non_blocking=True)
+                return x
+            new_args = tuple(_mv(a) for a in args)
+            if kwargs:
+                kwargs = {k: _mv(v) for k, v in kwargs.items()}
+            return new_args, kwargs
 
         return hook
 
