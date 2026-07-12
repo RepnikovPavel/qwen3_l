@@ -155,6 +155,27 @@ class ModelManager:
         except Exception as e:  # noqa: BLE001
             return [{"error": f"{type(e).__name__}: {e}"}]
 
+    def ram_summary(self) -> dict:
+        """Process RSS (resident RAM) + total GPU VRAM, for the UI memory panel."""
+        try:
+            import resource  # noqa: PLC0415
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mib = rss_kb / 1024.0  # Linux reports KiB
+        except Exception:
+            rss_mib = 0.0
+        vram_total_mib = 0.0
+        vram_used_mib = 0.0
+        for g in self.vram_summary():
+            if "error" not in g:
+                vram_total_mib += g["total_mib"]
+                vram_used_mib += g["used_mib"]
+        return {
+            "rss_mib": round(rss_mib, 1),
+            "vram_total_mib": round(vram_total_mib, 1),
+            "vram_used_mib": round(vram_used_mib, 1),
+        }
+
+
     # ------------------------------------------------------------ load/unload
 
     def _do_load(self, model_id: str, device: str, expert_offload: bool) -> LoadedModel:
@@ -181,17 +202,21 @@ class ModelManager:
                 # NOT load it through device_map with a CPU entry (that triggers
                 # transformers' "weights conversion" validator and fails). Load
                 # via device_map="auto" across the GPUs ONLY (no CPU) — the
-                # layers split flat across cards (~15.5 GB each), then
-                # ExpertOffloader moves the routed-expert stacked tensors
-                # (27 GB) to CPU and pages them per forward. Resident per GPU
-                # drops to ~1 GB + one expert slab (~576 MiB) at a time.
+                # layers split flat across cards. Give a per-GPU memory cap
+                # (13 GiB) so the balancer leaves headroom for overhead+KV,
+                # otherwise 31 GB onto 2x16 GB is too tight and OOMs at load.
+                # ExpertOffloader then moves the 27 GB routed-expert tensors to
+                # CPU and pages them per forward.
                 from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
+                cap_gib = int(__import__("os").environ.get("DEMO_MOE_GPU_GIB", "15"))
+                max_memory = {i: f"{cap_gib}GiB" for i in range(torch.cuda.device_count())}
                 model = AutoModelForCausalLM.from_pretrained(
                     path, torch_dtype="auto", device_map="auto",
+                    max_memory=max_memory,
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
                 self._offloader = ExpertOffloader.install(model)
-                placement = {"mode": "expert_offload",
+                placement = {"mode": "expert_offload", "cap_gib": cap_gib,
                              "n_layers": len(model.model.layers),
                              "hfm": len(getattr(model, "hf_device_map", {}))}
                 device = "mp_cpu_offload"

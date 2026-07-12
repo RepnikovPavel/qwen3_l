@@ -148,7 +148,19 @@ def api_status():
     s = MANAGER.status()
     with GEN_LOCK:
         s["active_generations"] = list(GENERATIONS.keys())
+    s["ram"] = MANAGER.ram_summary()
     return s
+
+
+@app.get("/api/memory")
+def api_memory():
+    """Dedicated memory snapshot for the UI's 'how much GPU/CPU we consume' panel."""
+    return {
+        "vram": MANAGER.vram_summary(),
+        "ram": MANAGER.ram_summary(),
+        "loaded": MANAGER.current is not None,
+        "model_id": MANAGER.current.spec.id if MANAGER.current else None,
+    }
 
 
 # ===========================================================================
