@@ -162,6 +162,8 @@ class LayerStreamer:
         torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
 
         hidden_states = inputs_embeds
+        # MoE layers return router_logits; generate() expects them aggregated.
+        router_logits_all = []
         for i in range(0, n, chunk):
             current = layers[i:i + chunk]
             nxt = layers[i + chunk:i + 2 * chunk]
@@ -184,9 +186,22 @@ class LayerStreamer:
                     **kwargs,
                 )
                 # Layer may return a tuple (hidden, ...) or a dataclass.
-                hidden_states = out[0] if isinstance(out, tuple) else getattr(
-                    out, "last_hidden_state", out
-                )
+                if isinstance(out, tuple):
+                    hidden_states = out[0]
+                    # MoE tuples may carry router_logits at a known index.
+                    for item in out[1:]:
+                        if hasattr(item, "router_logits") or (
+                            torch.is_tensor(item) and item.dim() == 2
+                            and item.shape[0] == hidden_states.shape[1]
+                        ):
+                            router_logits_all.append(
+                                item.router_logits if hasattr(item, "router_logits") else item
+                            )
+                else:
+                    hidden_states = getattr(out, "last_hidden_state", out)
+                    rl = getattr(out, "router_logits", None)
+                    if rl is not None:
+                        router_logits_all.append(rl)
 
             # Async evict the chunk we just finished back to CPU.
             if nxt:  # only evict if there's more work (keep last chunk on GPU)
@@ -196,6 +211,15 @@ class LayerStreamer:
                 torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
 
         hidden_states = inner_self.norm(hidden_states)
+        # MoE generate() expects router_logits in the model output; use the
+        # MoE output dataclass when we collected any, else the plain one.
+        if router_logits_all:
+            from transformers.modeling_outputs import MoeModelOutputWithPast  # noqa: PLC0415
+            return MoeModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=past_key_values if use_cache else None,
+                router_logits=tuple(router_logits_all),
+            )
         from transformers.modeling_outputs import BaseModelOutputWithPast  # noqa: PLC0415
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
