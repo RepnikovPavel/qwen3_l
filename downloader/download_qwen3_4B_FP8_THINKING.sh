@@ -23,11 +23,23 @@ mkdir -p "$SNAPSHOT_DIR" || { echo "ERROR: Failed to create directory"; exit 1; 
 cd "$SNAPSHOT_DIR" || { echo "ERROR: Failed to change directory"; exit 1; }
 
 echo "STATUS: Downloading configuration and tokenizer files..."
+# Resilient per-file download: skip files already present (non-empty), retry
+# forever on transient failures, and treat only the essential files as fatal.
+ESSENTIAL_FILES="config.json generation_config.json tokenizer.json"
 for file in .gitattributes LICENSE README.md config.json generation_config.json \
             merges.txt tokenizer.json tokenizer_config.json vocab.json; do
-    if ! wget -q --show-progress "https://huggingface.co/$MODEL_ID/resolve/main/$file"; then
-        echo "ERROR: Failed to download $file"
-        exit 1
+    if [[ -s "$file" ]]; then
+        echo "SKIP (exists): $file"
+        continue
+    fi
+    if ! wget -q --show-progress --continue --tries=20 --read-timeout=30 --waitretry=3 \
+            "https://huggingface.co/$MODEL_ID/resolve/main/$file"; then
+        if echo "$ESSENTIAL_FILES" | grep -qw "$file"; then
+            echo "ERROR: Failed to download essential file $file"
+            exit 1
+        else
+            echo "WARN: Failed to download non-essential file $file (continuing)"
+        fi
     fi
 done
 
