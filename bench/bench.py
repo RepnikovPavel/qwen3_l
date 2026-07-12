@@ -65,6 +65,44 @@ def _gpu_worker(gpu_id: int, ckptdir: str, prompt: str, max_new_tokens: int,
                "traceback": traceback.format_exc()})
 
 
+def _mp_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
+               max_memory: dict | None, q: Queue):
+    """Worker: one model split across all visible GPUs (model-parallel).
+
+    Trades per-token latency for a larger effective memory pool, so a bigger
+    KV cache / longer context fits than on any single card.
+    """
+    try:
+        import torch  # noqa: PLC0415
+
+        from src.inference import generate, load_model  # noqa: PLC0415
+
+        tokenizer, model = load_model(ckptdir, "mp", max_memory=max_memory)
+        res = generate(tokenizer, model, prompt, max_new_tokens, "mp", seed)
+
+        # Peak memory per GPU.
+        mem = {}
+        for g in range(torch.cuda.device_count()):
+            mem[g] = round(torch.cuda.max_memory_allocated(g) / 1024 / 1024, 1)
+
+        q.put({
+            "worker": "mp (all gpus)",
+            "device": "mp",
+            "ok": True,
+            "output_ids": res["output_ids"],
+            "content": res["content"][:300],
+            "tokens_per_s": round(res["tokens_per_s"], 2),
+            "new_tokens": res["n_new"],
+            "elapsed_s": round(res["elapsed_s"], 2),
+            "mem_peak_mb": mem,
+            "n_gpus": torch.cuda.device_count(),
+        })
+    except Exception as e:  # noqa: BLE001
+        q.put({"worker": "mp (all gpus)", "device": "mp", "ok": False,
+               "error": f"{type(e).__name__}: {e}",
+               "traceback": traceback.format_exc()})
+
+
 def _cpu_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
                 n_threads: int, q: Queue):
     """Worker: dequantize FP8 → bf16 and run on CPU."""
@@ -127,7 +165,12 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen3-4B-Thinking-2507-FP8 multi-GPU + CPU benchmark")
     parser.add_argument("--ckptdir", type=str, default="/mnt/nvme/huggingface")
     parser.add_argument("--gpus", type=int, nargs="*", default=None,
-                        help="GPU ids to use (default: all visible GPUs)")
+                        help="GPU ids to use in parallel mode (default: all visible GPUs)")
+    parser.add_argument("--mp", action="store_true",
+                        help="model-parallel: one model split across all GPUs (larger context). "
+                             "Mutually exclusive with parallel single-GPU workers.")
+    parser.add_argument("--mp-max-memory", type=str, default=None,
+                        help="per-GPU memory cap for model-parallel, e.g. '0:14GiB,1:14GiB'")
     parser.add_argument("--no-cpu", action="store_true", help="skip the CPU worker")
     parser.add_argument("--no-gpu", action="store_true", help="skip GPU workers (CPU only)")
     parser.add_argument("--cpu-threads", type=int, default=0,
@@ -142,12 +185,13 @@ def main():
 
     # Discover GPUs.
     gpu_ids = []
+    n_gpus = 0
     if not args.no_gpu:
         try:
             import torch  # noqa: PLC0415
 
-            n = torch.cuda.device_count()
-            gpu_ids = args.gpus if args.gpus is not None else list(range(n))
+            n_gpus = torch.cuda.device_count()
+            gpu_ids = args.gpus if args.gpus is not None else list(range(n_gpus))
             for g in gpu_ids:
                 print(f"[plan] GPU {g}: {torch.cuda.get_device_name(g)} "
                       f"(SM{torch.cuda.get_device_capability(g)[0]})", flush=True)
@@ -155,18 +199,40 @@ def main():
             print(f"[plan] CUDA unavailable ({e}); GPU workers disabled", flush=True)
             gpu_ids = []
 
+    # Mode resolution: --mp uses one model across all GPUs; otherwise launch one
+    # worker per GPU in parallel. The two are mutually exclusive (they would
+    # fight for the same cards).
+    use_mp = args.mp and n_gpus >= 2
+    if args.mp and n_gpus < 2:
+        print(f"[plan] --mp requested but only {n_gpus} GPU(s) found; falling back to parallel mode", flush=True)
+
     run_cpu = (not args.no_cpu)
-    print(f"[plan] GPUs={gpu_ids}  CPU={run_cpu}  max_new_tokens={args.max_new_tokens}", flush=True)
+    mode = "model-parallel" if use_mp else ("parallel" if gpu_ids else "none")
+    print(f"[plan] mode={mode}  GPUs={gpu_ids}  CPU={run_cpu}  max_new_tokens={args.max_new_tokens}", flush=True)
+
+    max_memory = None
+    if use_mp and args.mp_max_memory:
+        max_memory = {}
+        for part in args.mp_max_memory.split(","):
+            dev, mem = part.split(":")
+            max_memory[int(dev)] = mem
 
     q: Queue = Queue()
     procs = []
-    # Launch all GPU workers + the CPU worker simultaneously so GPUs are driven
-    # in parallel (loaded to 100%) while the CPU worker also runs.
-    for g in gpu_ids:
-        p = Process(target=_gpu_worker,
-                    args=(g, args.ckptdir, args.prompt, args.max_new_tokens, args.seed, q))
+    if use_mp:
+        p = Process(target=_mp_worker,
+                    args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
+                          max_memory, q))
         p.start()
         procs.append(p)
+    else:
+        # Parallel: one worker per GPU, launched simultaneously so every GPU is
+        # driven to 100%. The CPU worker also runs concurrently.
+        for g in gpu_ids:
+            p = Process(target=_gpu_worker,
+                        args=(g, args.ckptdir, args.prompt, args.max_new_tokens, args.seed, q))
+            p.start()
+            procs.append(p)
     if run_cpu:
         p = Process(target=_cpu_worker,
                     args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
@@ -185,6 +251,7 @@ def main():
     # ---- Report -----------------------------------------------------------
     print("\n" + "=" * 70)
     gpu_tps = []
+    mp_tps = None
     cpu_tps = None
     for r in sorted(results, key=lambda x: (x["device"], x.get("gpu_id", -1))):
         if not r["ok"]:
@@ -197,6 +264,11 @@ def main():
             print(f"[OK] {r['worker']}: {r['tokens_per_s']} tok/s | "
                   f"{r['new_tokens']} tok in {r['elapsed_s']}s | "
                   f"mem {r['mem_peak_mb']} MB")
+        elif r["device"] == "mp":
+            mp_tps = r["tokens_per_s"]
+            print(f"[OK] {r['worker']}: {r['tokens_per_s']} tok/s | "
+                  f"{r['new_tokens']} tok in {r['elapsed_s']}s | "
+                  f"mem/GPU {r['mem_peak_mb']} MB")
         else:
             cpu_tps = r["tokens_per_s"]
             print(f"[OK] {r['worker']}: {r['tokens_per_s']} tok/s | "
@@ -212,12 +284,13 @@ def main():
 
     print("\n" + "=" * 70)
     print("RESULTS (markdown):")
-    print("model version | gpu token/s | cpu token/s")
+    print("model version | gpu token/s | cpu token/s | model-parallel token/s")
     gpu_str = ", ".join(f"{t}" for t in gpu_tps) if gpu_tps else "-"
     if len(gpu_tps) > 1:
         gpu_str = f"{gpu_str} (each), {round(sum(gpu_tps), 2)} total"
     cpu_str = cpu_tps if cpu_tps is not None else "-"
-    print(f"{args.model_version} | {gpu_str} | {cpu_str}")
+    mp_str = mp_tps if mp_tps is not None else "-"
+    print(f"{args.model_version} | {gpu_str} | {cpu_str} | {mp_str}")
     print("=" * 70)
 
     if args.out:

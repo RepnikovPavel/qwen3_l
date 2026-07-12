@@ -38,11 +38,20 @@ def _model_path(ckptdir: str) -> str:
     return os.path.join(ckptdir, MODEL_REL)
 
 
-def load_model(ckptdir: str, device: str, gpu_id: int = 0, eager_attn: bool = False):
+def load_model(ckptdir: str, device: str, gpu_id: int = 0, eager_attn: bool = False,
+               max_memory: dict | None = None):
     """Load tokenizer + model for ``device``.
 
-    GPU: loads to CPU then moves to cuda:<gpu_id> (avoids OOM during load).
-    CPU: dequantizes FP8 → bf16 layers so no Triton kernel is needed.
+    device options:
+      - "cuda": single-GPU. Loads to CPU then moves to cuda:<gpu_id>.
+      - "mp":   model-parallel across multiple GPUs via device_map="auto"
+                (one logical model split across cards → fits a larger context /
+                larger KV cache than a single card).
+      - "cpu":  dequantizes FP8 → bf16 layers so no Triton kernel is needed.
+
+    For "mp", ``max_memory`` can cap per-device memory (e.g.
+    {0: "14GiB", 1: "14GiB"}) to leave headroom for the KV cache; if omitted,
+    accelerate balances the split automatically.
 
     Returns (tokenizer, model).
     """
@@ -58,6 +67,30 @@ def load_model(ckptdir: str, device: str, gpu_id: int = 0, eager_attn: bool = Fa
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
     attn_impl = "eager" if eager_attn else "sdpa"
+
+    if device == "mp":
+        # Model-parallel: place one model across multiple GPUs at load time.
+        # We must NOT move it afterwards (accelerate owns the placement).
+        import torch  # noqa: PLC0415
+
+        n_gpus = torch.cuda.device_count()
+        if n_gpus < 2:
+            raise RuntimeError(
+                f"model-parallel needs >=2 GPUs, found {n_gpus}. Use --device cuda."
+            )
+        device_map_arg = "auto" if max_memory is None else "balanced"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype="auto",
+            device_map=device_map_arg,
+            max_memory=max_memory,
+            local_files_only=True,
+            attn_implementation=attn_impl,
+        ).eval()
+        placement = getattr(model, "hf_device_map", {})
+        print(f"[load] model-parallel across {n_gpus} GPUs, placement={placement}", flush=True)
+        return tokenizer, model
+
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype="auto",
@@ -102,7 +135,15 @@ def generate(tokenizer, model, prompt: str, max_new_tokens: int = 2048,
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    # For model-parallel, place inputs on the device of the first layer
+    # (model.hf_device_map maps modules → devices; the embed/lm_head device is
+    # where inputs must live). For single-device models, use model.device.
+    if hasattr(model, "hf_device_map") and getattr(model, "hf_device_map", None):
+        hdm = model.hf_device_map
+        input_device = next(iter(hdm.values())) if hdm else model.device
+    else:
+        input_device = model.device
+    model_inputs = tokenizer([text], return_tensors="pt").to(input_device)
     n_prompt = model_inputs.input_ids.shape[1]
 
     with torch.no_grad():
@@ -142,16 +183,27 @@ def generate(tokenizer, model, prompt: str, max_new_tokens: int = 2048,
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-4B-Thinking-2507-FP8 inference / benchmark")
     parser.add_argument("--ckptdir", type=str, default="/mnt/nvme/huggingface")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--gpu-id", type=int, default=0, help="CUDA device index")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "mp"],
+                        help="cuda=single GPU, mp=model-parallel across GPUs, cpu=host")
+    parser.add_argument("--gpu-id", type=int, default=0, help="CUDA device index (single-GPU)")
+    parser.add_argument("--max-memory", type=str, default=None,
+                        help="per-GPU memory cap for model-parallel, e.g. '0:14GiB,1:14GiB'")
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eager-attn", action="store_true", help="use eager attention (CPU-safe)")
     args = parser.parse_args()
 
+    max_memory = None
+    if args.max_memory:
+        max_memory = {}
+        for part in args.max_memory.split(","):
+            dev, mem = part.split(":")
+            max_memory[int(dev)] = mem
+
     print(f"[load] device={args.device} gpu_id={args.gpu_id} ckptdir={args.ckptdir}", flush=True)
-    tokenizer, model = load_model(args.ckptdir, args.device, args.gpu_id, args.eager_attn)
+    tokenizer, model = load_model(args.ckptdir, args.device, args.gpu_id,
+                                  args.eager_attn, max_memory=max_memory)
 
     print(f"[generate] prompt={args.prompt!r} max_new_tokens={args.max_new_tokens}", flush=True)
     result = generate(tokenizer, model, args.prompt, args.max_new_tokens, args.device, args.seed)
