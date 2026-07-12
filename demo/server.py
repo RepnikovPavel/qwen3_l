@@ -1,21 +1,18 @@
 """
-FastAPI web demo server for Qwen3-4B-Thinking-2507-FP8.
+FastAPI web demo server for Qwen3 (4B dense + 30B MoE).
 
-Runs the model on the server (model-parallel across all visible GPUs by default
-— layers split flat across cards so a single model spans them), and streams
-generated tokens to a browser UI via Server-Sent Events.
+Features:
+  - Model selection: qwen3-4b (dense) and qwen3-30b-a3b (MoE).
+  - Lazy load: the model is loaded on the first /api/chat request and kept hot;
+    auto-unloaded after DEMO_IDLE_TIMEOUT seconds of inactivity. Manual load /
+    unload / reset-context endpoints exposed for the UI buttons.
+  - Devices: mp (model-parallel, default), cuda (single GPU), cpu, and
+    expert_offload for the 30B MoE (experts in CPU RAM).
+  - Streams tokens via SSE, splitting each chunk into thinking/answer phases,
+    with live tok/s and KV-cache context accounting.
+  - /api/status reports per-GPU used/free MiB for the UI's VRAM meters.
 
-Layout of the response stream (one JSON object per line, SSE `data:` frames):
-  {"type":"meta",   ...}                — session info: model, gpu placement
-  {"type":"prompt", "tokens": N}        — prompt token count (prefill size)
-  {"type":"ctx",    "used":..,"max":.., "kv_bytes":..} — context budget
-  {"type":"token",  "phase":"thinking"|"answer", "text": ".."} — per-token
-  {"type":"stats",  "tps":.., "n":.., "elapsed":..}   — final statistics
-  {"type":"done"}
-  {"type":"error",  "message": ".."}
-
-Access from your laptop via an SSH tunnel (the server binds to 0.0.0.0 so the
-tunnel can reach it):
+Access from your laptop via an SSH tunnel:
 
     ssh -L 8000:localhost:8000 tuna-server
     # then open http://localhost:8000 in your browser
@@ -28,170 +25,133 @@ import threading
 import time
 from pathlib import Path
 
-# Offline mode must be set before transformers is imported (it's imported via
-# src.inference). Set it early, right here.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.inject_kernel import inject_fp8_kernel  # noqa: E402
-from src.inference import _model_path  # noqa: E402
+from src.model_manager import ModelManager  # noqa: E402
+from src.models import list_models  # noqa: E402
 from demo import (  # noqa: E402
     GenerationStats,
-    ModelInfo,
-    context_used_tokens,
     fmt_bytes,
     make_streamer,
     split_thinking,
 )
 
-app = FastAPI(title="Qwen3-4B-Thinking-2507-FP8 demo")
+app = FastAPI(title="Qwen3 demo (4B + 30B-MoE)")
 
-# ----------------------------------------------------------------------------
-# Globals: model + tokenizer loaded once at import (kept hot across requests).
-# ----------------------------------------------------------------------------
-STATE: dict = {"tokenizer": None, "model": None, "info": None, "placement": None}
+CKPTDIR = os.environ.get("CKPTDIR", "/mnt/nvme/huggingface")
+MANAGER = ModelManager(CKPTDIR)
 
-
-def _load():
-    if STATE["model"] is not None:
-        return
-    import torch  # noqa: PLC0415
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
-
-    inject_fp8_kernel()
-    ckptdir = os.environ.get("CKPTDIR", "/mnt/nvme/huggingface")
-    model_path = _model_path(ckptdir)
-    print(f"[demo] loading model from {model_path}", flush=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-
-    n_gpus = torch.cuda.device_count()
-    device = os.environ.get("DEMO_DEVICE", "mp")  # default: model-parallel ("flat")
-    if device == "mp" and n_gpus >= 2:
-        # Model-parallel ("flat"): one model, layers split across all GPUs via
-        # device_map="auto". This is the default scenario per the task.
-        max_memory = None
-        mm = os.environ.get("DEMO_MP_MAX_MEMORY")
-        if mm:
-            max_memory = {}
-            for part in mm.split(","):
-                dev, mem = part.split(":")
-                max_memory[int(dev)] = mem
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype="auto",
-            device_map="auto",
-            max_memory=max_memory,
-            local_files_only=True,
-            attn_implementation="sdpa",
-        ).eval()
-        placement = dict(getattr(model, "hf_device_map", {}))
-        print(f"[demo] model-parallel across {n_gpus} GPUs: "
-              f"{len(placement)} module(s) placed", flush=True)
-    elif device == "cpu":
-        # CPU path: dequantize FP8 -> bf16 so no Triton kernel is needed.
-        from src.dequant import dequantize_model  # noqa: PLC0415
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype="auto", device_map="cpu",
-            local_files_only=True, attn_implementation="eager",
-        ).eval()
-        dequantize_model(model)
-        model = model.to(torch.bfloat16)
-        placement = {"cpu": "all"}
-    else:
-        # Single GPU (cuda:<id>).
-        gpu_id = int(os.environ.get("DEMO_GPU_ID", "0"))
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype="auto", device_map="cpu",
-            local_files_only=True, attn_implementation="sdpa",
-        ).eval().to(f"cuda:{gpu_id}")
-        placement = {f"cuda:{gpu_id}": "all"}
-
-    STATE["tokenizer"] = tokenizer
-    STATE["model"] = model
-    STATE["info"] = ModelInfo.from_model(model)
-    STATE["placement"] = placement
-    print(f"[demo] ready. KV budget: {fmt_bytes(STATE['info'].max_kv_bytes)} "
-          f"@ {STATE['info'].max_position_embeddings} tokens", flush=True)
+# Per-model conversation history (kept here so reset_context can drop it).
+HISTORY: dict[str, list[dict]] = {}
 
 
-# Eagerly load on import so the worker is hot as soon as it serves.
-_load()
-
-
-class ChatRequest(BaseModel):
-    message: str
-    max_new_tokens: int = 8192
-    history: list[dict] | None = None  # [{"role":"user"/"assistant","content":".."}]
-
-
+# ---------------------------------------------------------------------------
+# Static / metadata endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 def index():
     return FileResponse(Path(__file__).resolve().parent / "web" / "index.html")
 
 
-@app.get("/api/info")
-def info():
-    """Static session info for the UI header."""
-    i = STATE["info"]
-    return {
-        "model": "Qwen3-4B-Thinking-2507-FP8",
-        "mode": os.environ.get("DEMO_DEVICE", "mp"),
-        "placement": _summarize_placement(STATE["placement"]),
-        "max_position_embeddings": i.max_position_embeddings,
-        "kv_bytes_per_token": i.bytes_per_token,
-        "kv_bytes_per_token_hr": fmt_bytes(i.bytes_per_token),
-    }
+@app.get("/api/models")
+def api_models():
+    return {"models": [
+        {"id": m.id, "display_name": m.display_name,
+         "moe": m.moe, "fp8": m.fp8,
+         "size_gb": round(m.size_bytes / 1024**3, 1),
+         "short_desc": m.short_desc}
+        for m in list_models()
+    ]}
 
 
-def _summarize_placement(placement: dict) -> str:
-    """Collapse the per-module device map to per-GPU layer ranges."""
-    if not placement:
-        return "unknown"
-    if "cpu" in placement:
-        return "CPU"
-    # Group transformer layers by device.
-    per_gpu: dict[int, list[int]] = {}
-    for name, dev in placement.items():
-        if ".layers." in name and dev in (0, 1) or isinstance(dev, int):
-            try:
-                li = int(name.split(".layers.")[1].split(".")[0])
-                per_gpu.setdefault(int(dev), []).append(li)
-            except (IndexError, ValueError):
-                pass
-    if not per_gpu:
-        # Fallback: just list devices.
-        devs = sorted(set(int(d) for d in placement.values() if isinstance(d, int)))
-        return ", ".join(f"GPU {d}" for d in devs) if devs else str(placement)
-    parts = []
-    for dev in sorted(per_gpu):
-        layers = sorted(per_gpu[dev])
-        parts.append(f"GPU {dev}: layers {layers[0]}-{layers[-1]} ({len(layers)})")
-    return " | ".join(parts)
+@app.get("/api/status")
+def api_status():
+    s = MANAGER.status()
+    s["history_turns"] = {k: len(v) for k, v in HISTORY.items()}
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Load / unload / reset — the UI buttons
+# ---------------------------------------------------------------------------
+class LoadRequest(BaseModel):
+    model_id: str
+    device: str = "mp"             # mp | cuda | cpu
+    expert_offload: bool = False   # MoE: keep experts in CPU RAM
+
+
+@app.post("/api/load")
+def api_load(req: LoadRequest):
+    try:
+        lm = MANAGER.get_or_load(req.model_id, req.device, req.expert_offload)
+        HISTORY.pop(req.model_id, None)  # fresh context on (re)load
+        return {"ok": True, "model_id": lm.spec.id, "device": lm.device,
+                "display_name": lm.spec.display_name}
+    except Exception as e:  # noqa: BLE001
+        import traceback  # noqa: PLC0415
+        raise HTTPException(500, f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+@app.post("/api/unload")
+def api_unload():
+    ok = MANAGER.unload()
+    HISTORY.clear()
+    return {"ok": ok}
+
+
+@app.post("/api/reset")
+def api_reset():
+    """Reset the conversation context (drops history)."""
+    if MANAGER.current is not None:
+        mid = MANAGER.current.spec.id
+        HISTORY.pop(mid, None)
+        MANAGER.reset_context()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Chat (SSE streaming)
+# ---------------------------------------------------------------------------
+class ChatRequest(BaseModel):
+    message: str
+    model_id: str | None = None   # if set and differs from loaded -> swap
+    device: str = "mp"
+    expert_offload: bool = False
+    max_new_tokens: int = 8192
 
 
 @app.post("/api/chat")
 def chat(req: ChatRequest):
-    """Generate a streamed response. Tokens flow as SSE data frames."""
     import torch  # noqa: PLC0415
 
-    tokenizer = STATE["tokenizer"]
-    model = STATE["model"]
-    info = STATE["info"]
+    # Decide which model to use: the requested one, or the currently loaded one.
+    model_id = req.model_id
+    if model_id is None:
+        if MANAGER.current is None:
+            raise HTTPException(400, "no model loaded; call /api/load first")
+        model_id = MANAGER.current.spec.id
 
-    # Build the message list from history + the new turn.
-    messages = list(req.history or [])
+    try:
+        lm = MANAGER.get_or_load(model_id, req.device, req.expert_offload)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"load failed: {type(e).__name__}: {e}")
+
+    tokenizer = lm.tokenizer
+    model = lm.model
+    info = lm.info
+    history = HISTORY.setdefault(lm.spec.id, [])
+
+    messages = list(history)
     messages.append({"role": "user", "content": req.message})
-
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )
@@ -209,17 +169,19 @@ def chat(req: ChatRequest):
             inputs = tokenizer([text], return_tensors="pt").to(input_device)
             n_prompt = inputs.input_ids.shape[1]
 
-            yield sse({"type": "prompt", "tokens": n_prompt})
-            used, mx = context_used_tokens(info, n_prompt)
-            yield sse({"type": "ctx", "used": used, "max": mx,
+            yield sse({"type": "prompt", "tokens": n_prompt,
+                       "model_id": lm.spec.id, "moe": lm.spec.moe,
+                       "device": lm.device})
+            yield sse({"type": "ctx", "used": n_prompt, "max": info.max_position_embeddings,
                        "kv_bytes": info.bytes_per_token * n_prompt,
                        "kv_bytes_hr": fmt_bytes(info.bytes_per_token * n_prompt),
                        "kv_bytes_per_token": info.bytes_per_token})
+            # Snapshot VRAM at the start so the UI shows what the model occupies.
+            yield sse({"type": "vram", "gpus": MANAGER.vram_summary()})
 
             streamer = make_streamer(tokenizer)
             stats = GenerationStats(prompt_tokens=n_prompt)
 
-            # Run generation on a background thread; consume the streamer here.
             gen_kwargs = dict(
                 **inputs,
                 max_new_tokens=req.max_new_tokens,
@@ -237,12 +199,12 @@ def chat(req: ChatRequest):
             last_answer = ""
             try:
                 for piece in streamer:
+                    MANAGER.touch()
                     accumulated += piece
                     stats.on_token()
                     thinking, answer = split_thinking(accumulated, saw_think_end)
                     if "</think>" in piece:
                         saw_think_end = True
-                    # Emit only the delta for each panel.
                     if thinking != last_thinking:
                         yield sse({"type": "token", "phase": "thinking",
                                    "text": thinking[len(last_thinking):]})
@@ -251,37 +213,38 @@ def chat(req: ChatRequest):
                         yield sse({"type": "token", "phase": "answer",
                                    "text": answer[len(last_answer):]})
                         last_answer = answer
-                    # Live stats + context (sequence grows by 1 per token).
                     seq_len = n_prompt + stats.n_new_tokens
-                    yield sse({"type": "stats_live", "tps": round(stats.tokens_per_s, 2),
+                    yield sse({"type": "stats_live",
+                               "tps": round(stats.tokens_per_s, 2),
                                "n": stats.n_new_tokens})
-                    yield sse({"type": "ctx", "used": seq_len, "max": mx,
+                    yield sse({"type": "ctx", "used": seq_len,
+                               "max": info.max_position_embeddings,
                                "kv_bytes": info.bytes_per_token * seq_len,
                                "kv_bytes_hr": fmt_bytes(info.bytes_per_token * seq_len),
                                "kv_bytes_per_token": info.bytes_per_token})
             finally:
                 thread.join()
+                MANAGER.touch()
 
             elapsed = time.perf_counter() - t_start
+            # Persist the turn into history.
+            history.append({"role": "user", "content": req.message})
+            history.append({"role": "assistant", "content": last_answer})
             yield sse({"type": "stats", "tps": round(stats.tokens_per_s, 2),
                        "n": stats.n_new_tokens, "elapsed": round(elapsed, 2),
                        "prompt_tokens": n_prompt})
+            yield sse({"type": "vram", "gpus": MANAGER.vram_summary()})
             yield sse({"type": "done"})
         except Exception as e:  # noqa: BLE001
             import traceback  # noqa: PLC0415
             yield sse({"type": "error", "message": f"{type(e).__name__}: {e}",
                        "traceback": traceback.format_exc()})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
 
 if __name__ == "__main__":
     import uvicorn  # noqa: PLC0415
-
     port = int(os.environ.get("PORT", "8000"))
-    # Pass the app object directly (NOT the "demo.server:app" string) so uvicorn
-    # doesn't re-import this module — that would run _load() twice and
-    # double-initialize CUDA. With the object form the already-loaded model
-    # is reused.
+    # Pass the app object (not the "module:app" string) to avoid a re-import
+    # that would re-run module-level setup a second time.
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
                 timeout_keep_alive=300)

@@ -3,99 +3,94 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen3-4B-Thinking-2507-FP8 demo</title>
+<title>Qwen3 demo (4B + 30B-MoE)</title>
 <style>
   :root{
     --bg:#0f1115; --panel:#171a21; --panel2:#1f242e; --border:#2a313d;
     --text:#e6e8eb; --muted:#8b94a3; --accent:#5b9cff; --accent2:#7ee787;
-    --think:#f0b429; --danger:#ff6b6b;
+    --think:#f0b429; --danger:#ff6b6b; --warn:#f0883e;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
-  body{
-    background:var(--bg);color:var(--text);
-    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    font-size:14px;line-height:1.5;
-  }
-  header{
-    display:flex;align-items:center;gap:14px;padding:10px 16px;
-    background:var(--panel);border-bottom:1px solid var(--border);
-  }
-  header h1{font-size:15px;margin:0;font-weight:600}
-  header .badge{
-    background:var(--panel2);border:1px solid var(--border);
-    padding:3px 8px;border-radius:6px;font-size:11px;color:var(--muted);
-  }
+  body{background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.5}
+  header{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+  header h1{font-size:14px;margin:0;font-weight:600;white-space:nowrap}
+  header select,header button{background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 9px;font-size:12px;font-family:inherit}
+  header select:focus{outline:none;border-color:var(--accent)}
+  header button{cursor:pointer}
+  header button:hover{filter:brightness(1.12)}
+  header button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  header button.danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+  header button.warn{background:var(--warn);color:#fff;border-color:var(--warn)}
+  header button:disabled{opacity:.45;cursor:not-allowed}
+  header .badge{background:var(--panel2);border:1px solid var(--border);padding:3px 8px;border-radius:6px;font-size:11px;color:var(--muted)}
   header .badge b{color:var(--accent2);font-weight:600}
-  main{
-    display:grid;grid-template-columns:1fr 1fr;gap:1px;
-    height:calc(100vh - 53px);background:var(--border);
-  }
+  header .badge.loaded b{color:var(--accent2)}
+  header .badge.unloaded b{color:var(--muted)}
+  header .spacer{flex:1}
+  #status-text{font-size:11px;color:var(--muted);min-width:120px}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:1px;height:calc(100vh - 92px);background:var(--border)}
   .col{background:var(--bg);display:flex;flex-direction:column;min-width:0}
-  .col-head{
-    display:flex;justify-content:space-between;align-items:center;
-    padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border);
-    font-size:12px;color:var(--muted);
-  }
+  .col-head{display:flex;justify-content:space-between;align-items:center;padding:7px 14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
   .col-head .title{font-weight:600;color:var(--text);text-transform:uppercase;letter-spacing:.04em}
-  .stats{display:flex;gap:14px;align-items:center}
+  .stats{display:flex;gap:12px;align-items:center}
   .stats span b{color:var(--accent2)}
   .stats .tps{color:var(--accent);font-variant-numeric:tabular-nums}
   .msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
   .msg{max-width:100%}
   .msg .role{font-size:11px;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.03em}
-  .msg.user .bubble{
-    background:var(--panel2);border:1px solid var(--border);
-    padding:8px 12px;border-radius:10px;display:inline-block;white-space:pre-wrap;word-break:break-word;
-  }
+  .msg.user .bubble{background:var(--panel2);border:1px solid var(--border);padding:8px 12px;border-radius:10px;display:inline-block;white-space:pre-wrap;word-break:break-word}
   .msg.assistant .bubble{white-space:pre-wrap;word-break:break-word}
-  .cursor{display:inline-block;width:7px;height:14px;background:var(--accent);
-    vertical-align:text-bottom;animation:blink 1s steps(2) infinite;margin-left:1px}
+  .cursor{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:text-bottom;animation:blink 1s steps(2) infinite;margin-left:1px}
   @keyframes blink{50%{opacity:0}}
-  .thinking-box{
-    flex:1;overflow-y:auto;padding:14px;
-    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;
-    white-space:pre-wrap;word-break:break-word;color:var(--think);line-height:1.55;
-  }
+  .thinking-box{flex:1;overflow-y:auto;padding:14px;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;color:var(--think);line-height:1.55}
   .thinking-empty{color:var(--muted);font-style:italic;font-family:inherit}
-  .ctx-panel{
-    background:var(--panel);border-top:1px solid var(--border);padding:10px 14px;
-    display:flex;flex-direction:column;gap:6px;
-  }
-  .ctx-row{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
+  .side-panel{display:flex;flex-direction:column;background:var(--panel);border-top:1px solid var(--border)}
+  .ctx-panel,.vram-panel{padding:10px 14px;border-top:1px solid var(--border)}
+  .vram-panel{background:var(--panel)}
+  .vram-panel:first-of-type{border-top:none}
+  .ctx-row{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:3px}
   .ctx-row b{color:var(--text);font-variant-numeric:tabular-nums}
-  .bar{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden;border:1px solid var(--border)}
-  .bar > div{height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));transition:width .2s}
-  .composer{
-    display:flex;gap:8px;padding:10px 14px;
-    background:var(--panel);border-top:1px solid var(--border);
-  }
-  textarea{
-    flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--text);
-    border-radius:8px;padding:8px 10px;font-family:inherit;font-size:13px;resize:none;
-    min-height:42px;max-height:120px;
-  }
+  .bar{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;border:1px solid var(--border);margin-bottom:8px}
+  .bar>div{height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));transition:width .2s}
+  .bar.vram>div{background:linear-gradient(90deg,var(--accent),var(--warn),var(--danger))}
+  .gpu-row{font-size:11px;color:var(--muted);display:flex;justify-content:space-between;margin-bottom:4px;font-variant-numeric:tabular-nums}
+  .composer{display:flex;gap:8px;padding:10px 14px;background:var(--panel);border-top:1px solid var(--border)}
+  textarea{flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-family:inherit;font-size:13px;resize:none;min-height:42px;max-height:120px}
   textarea:focus{outline:none;border-color:var(--accent)}
-  button{
-    background:var(--accent);color:#fff;border:0;border-radius:8px;padding:0 16px;
-    font-weight:600;cursor:pointer;font-size:13px;white-space:nowrap;
-  }
-  button:hover{filter:brightness(1.08)}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  button.stop{background:var(--danger)}
-  .err{color:var(--danger);padding:10px 14px;font-size:12px;white-space:pre-wrap}
-  .scroll-hint{opacity:.6;font-size:11px}
+  button.send{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:0 16px;font-weight:600;cursor:pointer;font-size:13px;white-space:nowrap}
+  button.send:hover{filter:brightness(1.08)}
+  button.send:disabled{opacity:.5;cursor:not-allowed}
+  .err{color:var(--danger);padding:8px 14px;font-size:12px;white-space:pre-wrap;max-height:120px;overflow:auto}
+  .loading-overlay{position:absolute;top:92px;left:0;right:0;background:rgba(15,17,21,.92);padding:20px;text-align:center;color:var(--muted);z-index:10;font-size:13px}
+  .loading-overlay .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .lbl{font-size:11px;color:var(--muted);margin-right:5px}
+  .opt{display:flex;align-items:center;gap:4px}
+  .opt input[type=checkbox]{accent-color:var(--accent)}
 </style>
 </head>
 <body>
 <header>
-  <h1>Qwen3-4B-Thinking-2507-FP8</h1>
-  <span class="badge" id="mode">mode: …</span>
-  <span class="badge" id="placement">placement: …</span>
-  <span class="badge" id="kv-rate">… bytes/tok</span>
+  <h1>Qwen3 demo</h1>
+  <span class="lbl">модель:</span>
+  <select id="model-select"></select>
+  <span class="lbl">device:</span>
+  <select id="device-select">
+    <option value="mp">mp (model-parallel, 2 GPU)</option>
+    <option value="cuda">cuda (1 GPU)</option>
+    <option value="cpu">cpu</option>
+  </select>
+  <label class="opt"><input type="checkbox" id="expert-offload"> expert offload (MoE→CPU)</label>
+  <button id="btn-load" class="primary">Загрузить</button>
+  <button id="btn-unload" class="warn">Выгрузить</button>
+  <button id="btn-reset" class="danger">Сброс контекста</button>
+  <span class="spacer"></span>
+  <span class="badge" id="mode-badge">—</span>
+  <span id="status-text">…</span>
 </header>
+<div class="loading-overlay" id="overlay" style="display:none"><span class="spin"></span><span id="overlay-text">загрузка…</span></div>
 <main>
-  <!-- LEFT: chat -->
   <section class="col">
     <div class="col-head">
       <span class="title">Chat</span>
@@ -106,12 +101,10 @@
     </div>
     <div class="msgs" id="msgs"></div>
     <div class="composer">
-      <textarea id="input" placeholder="Спросите что-нибудь…  (Enter — отправить, Shift+Enter — перенос строки)" rows="1"></textarea>
-      <button id="send">Отправить</button>
+      <textarea id="input" placeholder="Спросите… (Enter — отправить, Shift+Enter — перенос)" rows="1"></textarea>
+      <button class="send" id="send">Отправить</button>
     </div>
   </section>
-
-  <!-- RIGHT: thinking + context -->
   <section class="col">
     <div class="col-head">
       <span class="title">Thinking</span>
@@ -121,19 +114,16 @@
       </span>
     </div>
     <div class="thinking-box" id="thinking"><span class="thinking-empty">Здесь появится цепочка рассуждений модели…</span></div>
-    <div class="ctx-panel">
-      <div class="ctx-row">
-        <span>Контекст (KV-кэш)</span>
-        <span><b id="ctx-used">0</b> / <span id="ctx-max">0</span> токенов</span>
+    <div class="side-panel">
+      <div class="ctx-panel">
+        <div class="ctx-row"><span>Контекст (KV-кэш)</span><span><b id="ctx-used">0</b> / <span id="ctx-max">0</span> токенов</span></div>
+        <div class="bar"><div id="ctx-bar" style="width:0%"></div></div>
+        <div class="ctx-row"><span>prompt: <b id="ctx-prompt">0</b></span><span>осталось: <b id="ctx-left">0</b></span></div>
+        <div class="ctx-row"><span>KV-память</span><span><b id="kv-used">0 B</b> / <span id="kv-max">0 B</span></span></div>
       </div>
-      <div class="bar"><div id="ctx-bar" style="width:0%"></div></div>
-      <div class="ctx-row">
-        <span>Память KV-кэша</span>
-        <span><b id="kv-used">0 B</b> / <span id="kv-max">0 B</span></span>
-      </div>
-      <div class="ctx-row">
-        <span class="scroll-hint">prompt: <b id="ctx-prompt">0</b> · осталось: <b id="ctx-left">0</b></span>
-        <span><b id="kv-rate2">—</b>/токен</span>
+      <div class="vram-panel">
+        <div class="ctx-row"><span>Видеокарты (VRAM)</span><span id="vram-status">—</span></div>
+        <div id="vram-gpus"></div>
       </div>
     </div>
   </section>
@@ -141,128 +131,147 @@
 <div class="err" id="err" style="display:none"></div>
 
 <script>
-const $ = id => document.getElementById(id);
-let history = [];
-let generating = false;
-let abortCtrl = null;
-let kvBytesPerToken = 0;
+const $=id=>document.getElementById(id);
+let currentModel=null, kvBytesPerToken=0, generating=false;
+
+const fmtB=n=>{const u=['B','KiB','MiB','GiB','TiB','PiB'];let i=0;while(Math.abs(n)>=1024&&i<u.length-1){n/=1024;i++;}return n.toFixed(1)+' '+u[i];};
+
+function showError(t){const e=$('err');e.textContent=t;e.style.display=t?'block':'none';}
+function setOverlay(on,text){$('overlay').style.display=on?'block':'none';if(text)$('overlay-text').textContent=text;}
 
 async function boot(){
   try{
-    const r = await fetch('/api/info');
-    const d = await r.json();
-    $('mode').innerHTML = 'mode: <b>' + d.mode + '</b>';
-    $('placement').innerHTML = 'placement: <b>' + d.placement + '</b>';
-    kvBytesPerToken = d.kv_bytes_per_token;
-    $('kv-rate').textContent = fmtB(d.kv_bytes_per_token) + '/tok';
-    $('kv-rate2').textContent = fmtB(d.kv_bytes_per_token);
-    $('ctx-max').textContent = d.max_position_embeddings.toLocaleString('ru');
-    $('kv-max').textContent = fmtB(d.kv_bytes_per_token * d.max_position_embeddings);
-  }catch(e){ showError('info: ' + e); }
-}
-
-function fmtB(n){
-  const u=['B','KiB','MiB','GiB','TiB','PiB'];
-  let i=0; while(Math.abs(n)>=1024 && i<u.length-1){n/=1024;i++;} return n.toFixed(1)+' '+u[i];
-}
-
-function addMsg(role, text){
-  const wrap=document.createElement('div');
-  wrap.className='msg '+role;
-  wrap.innerHTML='<div class="role">'+role+'</div><div class="bubble"></div>';
-  wrap.querySelector('.bubble').textContent=text;
-  $('msgs').appendChild(wrap);
-  $('msgs').scrollTop=$('msgs').scrollHeight;
-  return wrap;
-}
-
-function showError(t){ const e=$('err'); e.textContent=t; e.style.display=t?'block':'none'; }
-
-function setCtx(used, max, kvBytesUsed, kvBytesMax){
-  $('ctx-used').textContent=used.toLocaleString('ru');
-  $('ctx-max').textContent=max.toLocaleString('ru');
-  const pct=Math.min(100,(used/max)*100);
-  $('ctx-bar').style.width=pct.toFixed(2)+'%';
-  $('kv-used').textContent=fmtB(kvBytesUsed);
-  $('kv-max').textContent=fmtB(kvBytesMax);
-  $('ctx-left').textContent=Math.max(0,max-used).toLocaleString('ru');
-}
-
-async function send(){
-  const text=$('input').value.trim();
-  if(!text || generating) return;
-  generating=true; $('send').disabled=true; $('send').textContent='…';
-  showError('');
-  addMsg('user', text);
-  const aWrap=addMsg('assistant','');
-  const bubble=aWrap.querySelector('.bubble');
-  const cursor=document.createElement('span'); cursor.className='cursor'; bubble.appendChild(cursor);
-  $('thinking').innerHTML='<span class="thinking-empty">…</span>';
-  let thinkingText=''; let answerText='';
-
-  try{
-    const resp=await fetch('/api/chat',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:text, history:history, max_new_tokens:8192}),
-    });
-    const reader=resp.body.getReader();
-    const dec=new TextDecoder();
-    let buf='';
-    let promptTokens=0, ctxMax=0;
-    while(true){
-      const {done,value}=await reader.read();
-      if(done) break;
-      buf+=dec.decode(value,{stream:true});
-      const frames=buf.split('\n\n'); buf=frames.pop();
-      for(const f of frames){
-        const line=f.trim();
-        if(!line.startsWith('data:')) continue;
-        const obj=JSON.parse(line.slice(5).trim());
-        if(obj.type==='prompt'){ promptTokens=obj.tokens; $('ctx-prompt').textContent=promptTokens.toLocaleString('ru'); }
-        else if(obj.type==='ctx'){
-          setCtx(obj.used, obj.max, obj.kv_bytes, kvBytesPerToken*obj.max);
-          ctxMax=obj.max;
-        }
-        else if(obj.type==='token'){
-          if(obj.phase==='thinking'){
-            thinkingText+=obj.text;
-            const box=$('thinking'); box.textContent=thinkingText; box.scrollTop=box.scrollHeight;
-          }else{
-            answerText+=obj.text;
-            bubble.textContent=answerText; bubble.appendChild(cursor);
-            $('msgs').scrollTop=$('msgs').scrollHeight;
-          }
-        }
-        else if(obj.type==='stats_live'){
-          $('tps-live').textContent=obj.tps.toFixed(2)+' tok/s';
-          $('gen-n').textContent=obj.n;
-        }
-        else if(obj.type==='stats'){
-          $('tps-final').textContent=obj.tps.toFixed(2);
-          $('elapsed').textContent=obj.elapsed;
-        }
-        else if(obj.type==='done'){
-          history.push({role:'user',content:text});
-          history.push({role:'assistant',content:answerText});
-        }
-        else if(obj.type==='error'){ showError(obj.message); }
-      }
+    const r=await fetch('/api/models');const d=await r.json();
+    const sel=$('model-select');sel.innerHTML='';
+    for(const m of d.models){
+      const o=document.createElement('option');o.value=m.id;
+      o.textContent=`${m.display_name}  (${m.size_gb} GB)`;o.dataset.moe=m.moe;
+      sel.appendChild(o);
     }
-    if(!answerText) bubble.textContent='(пустой ответ)';
-    else if(cursor.parentNode) cursor.remove();
-  }catch(e){ showError(e); }
-  finally{
-    generating=false; $('send').disabled=false; $('send').textContent='Отправить';
+    sel.dispatchEvent(new Event('change'));
+  }catch(e){showError('models: '+e);}
+  refreshStatus();
+  setInterval(refreshStatus,3000);
+}
+$('model-select').addEventListener('change',e=>{
+  const opt=e.target.selectedOptions[0];
+  const moe=opt&&opt.dataset.moe==='true';
+  $('expert-offload').disabled=!moe;
+  if(!moe)$('expert-offload').checked=false;
+});
+
+async function refreshStatus(){
+  try{
+    const r=await fetch('/api/status');const s=await r.json();
+    const b=$('mode-badge');b.className='badge '+(s.loaded?'loaded':'unloaded');
+    b.innerHTML=s.loaded?`<b>${s.display_name||s.model_id}</b> · ${s.device}`:'<b>не загружено</b>';
+    $('status-text').textContent=s.loaded?`idle ${Math.round(s.last_used_ago_s||0)}s / unload @ ${Math.round((s.idle_timeout_s||0)/60)}min`:'';
+    renderVram(s.vram||[]);
+  }catch(e){}
+}
+function renderVram(gpus){
+  const box=$('vram-gpus');box.innerHTML='';
+  if(!gpus||!gpus.length){box.innerHTML='<div class="gpu-row">нет GPU</div>';return;}
+  if(gpus[0].error){box.innerHTML=`<div class="gpu-row">${gpus[0].error}</div>`;return;}
+  for(const g of gpus){
+    const pct=g.total_mib?(g.used_mib/g.total_mib*100):0;
+    const row=document.createElement('div');
+    row.innerHTML=`<div class="gpu-row"><span>GPU${g.gpu} · ${g.name}</span><span><b>${g.used_mib.toFixed(0)}</b> / ${g.total_mib.toFixed(0)} MiB · free ${g.free_mib.toFixed(0)}</span></div>
+      <div class="bar vram"><div style="width:${pct.toFixed(1)}%"></div></div>`;
+    box.appendChild(row);
   }
 }
 
-$('send').addEventListener('click', send);
-$('input').addEventListener('keydown', e=>{
-  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-});
-$('input').addEventListener('input', e=>{
-  e.target.style.height='auto'; e.target.style.height=Math.min(120,e.target.scrollHeight)+'px';
-});
+function addMsg(role,text){
+  const wrap=document.createElement('div');wrap.className='msg '+role;
+  wrap.innerHTML='<div class="role">'+role+'</div><div class="bubble"></div>';
+  wrap.querySelector('.bubble').textContent=text;
+  $('msgs').appendChild(wrap);$('msgs').scrollTop=$('msgs').scrollHeight;
+  return wrap;
+}
+function setCtx(used,max,kvUsed,kvMax){
+  $('ctx-used').textContent=used.toLocaleString('ru');
+  $('ctx-max').textContent=max.toLocaleString('ru');
+  $('ctx-bar').style.width=Math.min(100,used/max*100).toFixed(2)+'%';
+  $('kv-used').textContent=fmtB(kvUsed);$('kv-max').textContent=fmtB(kvMax);
+  $('ctx-left').textContent=Math.max(0,max-used).toLocaleString('ru');
+}
+
+async function doLoad(){
+  const model_id=$('model-select').value;
+  const device=$('device-select').value;
+  const expert_offload=$('expert-offload').checked;
+  setOverlay(true,`загрузка ${model_id} (${device})… может занять минуту`);
+  showError('');
+  try{
+    const r=await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_id,device,expert_offload})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'load failed');
+    currentModel=d.model_id;kvBytesPerToken=0;
+    refreshStatus();
+  }catch(e){showError('load: '+e.message);}
+  finally{setOverlay(false);}
+}
+async function doUnload(){
+  setOverlay(true,'выгрузка…');
+  try{await fetch('/api/unload',{method:'POST'});currentModel=null;$('msgs').innerHTML='';$('thinking').innerHTML='<span class="thinking-empty">…</span>';}
+  catch(e){showError(e);}
+  finally{setOverlay(false);refreshStatus();}
+}
+async function doReset(){
+  try{await fetch('/api/reset',{method:'POST'});
+    $('msgs').innerHTML='';$('thinking').innerHTML='<span class="thinking-empty">контекст сброшен</span>';}
+  catch(e){showError(e);}
+  refreshStatus();
+}
+
+async function send(){
+  const text=$('input').value.trim();if(!text||generating)return;
+  const model_id=$('model-select').value;
+  const device=$('device-select').value;
+  const expert_offload=$('expert-offload').checked;
+  generating=true;$('send').disabled=true;$('send').textContent='…';showError('');
+  addMsg('user',text);
+  const aWrap=addMsg('assistant','');const bubble=aWrap.querySelector('.bubble');
+  const cursor=document.createElement('span');cursor.className='cursor';bubble.appendChild(cursor);
+  $('thinking').innerHTML='<span class="thinking-empty">…</span>';
+  let thinkingText='',answerText='';
+  try{
+    const resp=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,model_id,device,expert_offload,max_new_tokens:8192})});
+    if(!resp.ok){const e=await resp.json();throw new Error(e.detail||'chat failed');}
+    const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';
+    while(true){
+      const{done,value}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const frames=buf.split('\n\n');buf=frames.pop();
+      for(const f of frames){
+        const line=f.trim();if(!line.startsWith('data:'))continue;
+        const obj=JSON.parse(line.slice(5).trim());
+        if(obj.type==='prompt'){$('ctx-prompt').textContent=obj.tokens.toLocaleString('ru');kvBytesPerToken=obj.kv||kvBytesPerToken;}
+        else if(obj.type==='ctx')setCtx(obj.used,obj.max,obj.kv_bytes,obj.kv_bytes_per_token*obj.max);
+        else if(obj.type==='vram')renderVram(obj.gpus||[]);
+        else if(obj.type==='token'){
+          if(obj.phase==='thinking'){thinkingText+=obj.text;const b=$('thinking');b.textContent=thinkingText;b.scrollTop=b.scrollHeight;}
+          else{answerText+=obj.text;bubble.textContent=answerText;bubble.appendChild(cursor);$('msgs').scrollTop=$('msgs').scrollHeight;}
+        }
+        else if(obj.type==='stats_live'){$('tps-live').textContent=obj.tps.toFixed(2)+' tok/s';$('gen-n').textContent=obj.n;}
+        else if(obj.type==='stats'){$('tps-final').textContent=obj.tps.toFixed(2);$('elapsed').textContent=obj.elapsed;}
+        else if(obj.type==='error')showError(obj.message);
+      }
+    }
+    if(!answerText)bubble.textContent='(пустой ответ)';else if(cursor.parentNode)cursor.remove();
+  }catch(e){showError(e.message);}
+  finally{generating=false;$('send').disabled=false;$('send').textContent='Отправить';refreshStatus();}
+}
+
+$('btn-load').addEventListener('click',doLoad);
+$('btn-unload').addEventListener('click',doUnload);
+$('btn-reset').addEventListener('click',doReset);
+$('send').addEventListener('click',send);
+$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+$('input').addEventListener('input',e=>{e.target.style.height='auto';e.target.style.height=Math.min(120,e.target.scrollHeight)+'px';});
 boot();
 </script>
 </body>
