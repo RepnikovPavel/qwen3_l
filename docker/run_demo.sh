@@ -37,6 +37,7 @@ docker run --rm \
     --runtime=nvidia \
     --gpus all \
     --ipc=host \
+    --network host \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
     -e NVIDIA_VISIBLE_DEVICES=all \
@@ -46,7 +47,6 @@ docker run --rm \
     -e DEMO_GPU_ID="${DEMO_GPU_ID:-0}" \
     -e DEMO_MP_MAX_MEMORY="${DEMO_MP_MAX_MEMORY:-}" \
     -e PORT="$PORT" \
-    -p "$PORT:$PORT" \
     --mount type=bind,src="$CKPTDIR",target="$CKPTDIR" \
     "$IMG_NAME" \
     python3 -m demo.server
