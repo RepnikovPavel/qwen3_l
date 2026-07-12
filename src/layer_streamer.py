@@ -134,8 +134,9 @@ class LayerStreamer:
         # rotary_emb cos/sin must live on the same GPU as q/k.
         position_embeddings = [p.to(self.device, non_blocking=True) for p in position_embeddings]
         position_ids = position_ids.to(self.device, non_blocking=True)
-        if past_key_values is not None:
-            past_key_values = past_key_values.to(self.device, non_blocking=True)
+        # NOTE: do NOT call past_key_values.to(device) — DynamicCache has no
+        # .to(); it inherits the device of the tensors written into it, which
+        # are produced by layers already on the GPU.
 
         # Causal mask (kept on GPU).
         mask_kwargs = dict(
