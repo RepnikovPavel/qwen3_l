@@ -155,11 +155,14 @@ def api_status():
 @app.get("/api/memory")
 def api_memory():
     """Dedicated memory snapshot for the UI's 'how much GPU/CPU we consume' panel."""
+    # Snapshot current ONCE to avoid a TOCTOU race with the idle-watcher that
+    # nulls MANAGER.current between the `is not None` check and the `.spec` read.
+    cur = MANAGER.current
     return {
         "vram": MANAGER.vram_summary(),
         "ram": MANAGER.ram_summary(),
-        "loaded": MANAGER.current is not None,
-        "model_id": MANAGER.current.spec.id if MANAGER.current else None,
+        "loaded": cur is not None,
+        "model_id": cur.spec.id if cur is not None else None,
     }
 
 
@@ -415,9 +418,10 @@ def chat(req: ChatRequest, request: Request):
     # Make sure a model is loaded.
     model_id = req.model_id
     if model_id is None:
-        if MANAGER.current is None:
+        cur = MANAGER.current  # snapshot to avoid race with idle-watcher
+        if cur is None:
             raise HTTPException(400, "no model loaded; call /api/load first")
-        model_id = MANAGER.current.spec.id
+        model_id = cur.spec.id
     try:
         lm = MANAGER.get_or_load(model_id, req.device, req.expert_offload)
     except Exception as e:  # noqa: BLE001

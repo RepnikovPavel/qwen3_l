@@ -179,6 +179,53 @@ class ModelManager:
     # ------------------------------------------------------------ load/unload
 
     def _do_load(self, model_id: str, device: str, expert_offload: bool) -> LoadedModel:
+        """Load with guaranteed cleanup on failure.
+
+        If anything in the load path raises (OOM, conversion error, ...), we
+        must not leave half-loaded weights holding VRAM/RAM. Catch, run the
+        full unload sequence, then re-raise so the caller sees the error.
+        """
+        try:
+            return self._do_load_impl(model_id, device, expert_offload)
+        except Exception:
+            # Best-effort cleanup of whatever partially-loaded state exists.
+            # Detach offloader/streamer hooks, drop the model, reclaim memory.
+            print("[manager] load failed — cleaning up partial state",
+                  exc_info=True, flush=True)
+            try:
+                if self._offloader is not None:
+                    self._offloader.remove()
+            except Exception:
+                pass
+            self._offloader = None
+            try:
+                if self._streamer is not None:
+                    self._streamer.remove()
+            except Exception:
+                pass
+            self._streamer = None
+            # If a model object was created before the error, move to CPU then del.
+            import gc as _gc  # noqa: PLC0415
+            import torch as _torch  # noqa: PLC0415
+            lm = self._loaded
+            self._loaded = None
+            if lm is not None:
+                try:
+                    lm.model.to("cpu")
+                except Exception:
+                    pass
+                del lm
+            _gc.collect()
+            try:
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    _torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            self._log_vram("after failed-load cleanup")
+            raise
+
+    def _do_load_impl(self, model_id: str, device: str, expert_offload: bool) -> LoadedModel:
         from src.inject_kernel import inject_fp8_kernel  # noqa: PLC0415
         from src.model_info import ModelInfo  # noqa: PLC0415
         from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
