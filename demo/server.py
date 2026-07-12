@@ -279,4 +279,9 @@ if __name__ == "__main__":
     import uvicorn  # noqa: PLC0415
 
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("demo.server:app", host="0.0.0.0", port=port, log_level="info")
+    # Pass the app object directly (NOT the "demo.server:app" string) so uvicorn
+    # doesn't re-import this module — that would run _load() twice and
+    # double-initialize CUDA. With the object form the already-loaded model
+    # is reused.
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                timeout_keep_alive=300)
