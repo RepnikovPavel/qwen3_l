@@ -1,32 +1,26 @@
 """
-Expert-level offload for Qwen3-MoE on a single GPU.
+Expert-level offload for Qwen3-MoE across the available GPUs.
 
-The model is 31 GB; a single 16 GB GPU can't hold it. But only the routed
-experts dominate (27 GB of stacked weight tensors). Everything else
-(attention, router, shared expert, layernorms, embeddings) is ~2 GB and fits
-trivially.
+The model is 31 GB; one 16 GB GPU can't hold it, and loading it through a
+device_map that mixes in CPU triggers transformers' FP8 "weights conversion"
+validator (the checkpoint is ALREADY quantized — that path is wrong).
 
 Strategy (the "flat layout + expert load/unload" you asked for):
-  - Load the FP8 checkpoint STRAIGHT onto one GPU with device_map={"":gpu}.
-    NO weight conversion — the checkpoint is already FP8, transformers loads
-    it as-is. (The earlier "weights conversion" error came from mixing CPU
-    into device_map, which triggers the FP8 quantizer validator.)
+  - Load via device_map="auto" across the GPUs ONLY (no CPU entry) → transformers
+    accepts it without conversion and splits the layers flat across cards
+    (layers 0..N/2 on gpu0, rest on gpu1). 31 GB / 2 ≈ 15.5 GB each — fits.
   - After load, walk every MoE layer and move ONLY its `mlp.experts` weight
-    tensors (gate_up_proj, down_proj) to CPU. The rest stays on the GPU.
-  - Install a forward pre/post hook on each `mlp.experts` module that pages
-    its stacked tensors GPU<-CPU right before the experts run, and back to
-    CPU right after. Only the active layer's experts are on the GPU at any
-    moment (~576 MiB), so VRAM stays ~2 GB resident + one expert slab.
+    tensors (gate_up_proj, down_proj — 27 GB total) to CPU. The rest
+    (attention, router, shared expert, layernorms, embeddings — ~2 GB per GPU)
+    stays resident.
+  - Install forward pre/post hooks on each `mlp.experts` module that page its
+    stacked tensors onto the experts' home GPU right before they run, and back
+    to CPU after. Only the active layer's experts (~576 MiB) are on a GPU at
+    any moment, so VRAM stays ~1 GB resident + one expert slab.
 
-We monkeypatch the inner-model forward (not the layer forward) so the hook
-fire is automatic — no need to replace generate(). The expert module is
-called normally by Qwen3MoeSparseMoeBlock.forward; our hook just relocates
-its parameters in time.
-
-Usage:
-    ExpertOffloader.install(model, gpu_id=0)
-    ... model.generate(...)   # experts page in/out automatically
-    ExpertOffloader.remove(model)
+We use module hooks (not a forward override) so the stock generate() works
+unchanged — the experts module is called normally by the MoE block; our hook
+just relocates its parameters in time.
 """
 from __future__ import annotations
 
@@ -37,16 +31,16 @@ import torch.nn as nn
 class ExpertOffloader:
     """Keeps routed-expert weight tensors on CPU, pages them per forward."""
 
-    def __init__(self, model: nn.Module, gpu: int = 0):
+    def __init__(self, model: nn.Module):
         self.model = model
-        self.gpu = gpu
-        self.device = f"cuda:{gpu}"
         self._handles: list = []
         self._installed = False
+        # Per-expert-module home GPU (discovered from where the module lives).
+        self._home_gpu: dict[int, int] = {}
 
     @classmethod
-    def install(cls, model: nn.Module, gpu: int = 0) -> "ExpertOffloader":
-        od = cls(model, gpu)
+    def install(cls, model: nn.Module) -> "ExpertOffloader":
+        od = cls(model)
         od._install()
         return od
 
@@ -55,12 +49,14 @@ class ExpertOffloader:
             h.remove()
         self._handles.clear()
         self._installed = False
-        # Restore experts to GPU so the model is in a clean state.
-        for experts in self._iter_expert_modules():
-            try:
-                experts.to(self.device)
-            except Exception:
-                pass
+        # Restore each experts module to its home GPU.
+        for idx, experts in enumerate(self._iter_expert_modules()):
+            gpu = self._home_gpu.get(idx)
+            if gpu is not None:
+                try:
+                    experts.to(f"cuda:{gpu}")
+                except Exception:
+                    pass
 
     def _iter_expert_modules(self):
         """Yield every Qwen3MoeExperts module (one per MoE layer)."""
@@ -77,42 +73,48 @@ class ExpertOffloader:
             return
         n = 0
         total_bytes = 0
-        for experts in self._iter_expert_modules():
+        for idx, experts in enumerate(self._iter_expert_modules()):
+            # Discover this module's home GPU from any of its params.
+            try:
+                sample = next(experts.parameters())
+                home_gpu = sample.device.index if sample.device.type == "cuda" else 0
+            except StopIteration:
+                home_gpu = 0
+            self._home_gpu[idx] = home_gpu
+            home = f"cuda:{home_gpu}"
+
             # Move expert params to CPU now (resident state = offloaded).
             for p in experts.parameters():
                 total_bytes += p.numel() * p.element_size()
                 p.data = p.data.to("cpu", non_blocking=False)
-            # Pre-hook: copy expert params onto the GPU before the module runs.
-            pre = experts.register_forward_pre_hook(self._make_pre_hook())
+            # Pre-hook: copy expert params onto their home GPU before the module runs.
+            pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
             # Post-hook: copy them back to CPU after (frees VRAM).
             post = experts.register_forward_hook(self._make_post_hook())
             self._handles.append(pre)
             self._handles.append(post)
             n += 1
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_available():
+            for g in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(f"cuda:{g}")
         self._installed = True
-        print(f"[expert-offload] {n} expert modules on CPU "
-              f"({total_bytes/1024**3:.2f} GiB); resident on GPU = rest of model",
+        print(f"[expert-offload] {n} expert modules moved to CPU "
+              f"({total_bytes/1024**3:.2f} GiB); resident per-GPU = rest of model",
               flush=True)
 
-    def _make_pre_hook(self):
-        """Build a closure that pages the expert tensors onto the GPU."""
-        dev = self.device
-
+    def _make_pre_hook(self, home: str):
+        """Build a closure that pages the expert tensors onto their home GPU."""
         def hook(_module, args):
-            # The MoE block calls experts(...) with the routed token batch.
-            # Move BOTH the expert params AND the incoming activation tensor
-            # onto the GPU. (The activation arrives on the GPU already since
-            # attention/router/shared live there, but be defensive.)
             for p in _module.parameters():
                 if p.device.type == "cpu":
-                    p.data = p.data.to(dev, non_blocking=False)
+                    p.data = p.data.to(home, non_blocking=False)
+            # The activation tensor is produced by the MoE block (on the home GPU
+            # already since router/shared live there), but be defensive.
             new_args = []
             for a in args:
-                if isinstance(a, torch.Tensor) and a.device.type != dev:
-                    a = a.to(dev, non_blocking=False)
+                if isinstance(a, torch.Tensor) and str(a.device) != home:
+                    a = a.to(home, non_blocking=False)
                 new_args.append(a)
-            # Return the (possibly relocated) args so the module sees them.
             return tuple(new_args)
 
         return hook
@@ -126,3 +128,4 @@ class ExpertOffloader:
             return output
 
         return hook
+

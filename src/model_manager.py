@@ -178,21 +178,22 @@ class ModelManager:
         if device == "mp" and torch.cuda.device_count() >= 2:
             if expert_offload and spec.moe:
                 # MoE (30B): the FP8 checkpoint is ALREADY quantized, so we must
-                # NOT route it through device_map with CPU entries — transformers
-                # would try to "convert" the FP8 weights and fail. Load the whole
-                # model straight onto ONE gpu with device_map={"":gpu}, then move
-                # ONLY the routed-expert weight tensors (27 GB of 31) to CPU and
-                # page them per forward via ExpertOffloader. Resident GPU footprint
-                # drops to ~2 GB (attention+router+shared+embed), experts page in.
+                # NOT load it through device_map with a CPU entry (that triggers
+                # transformers' "weights conversion" validator and fails). Load
+                # via device_map="auto" across the GPUs ONLY (no CPU) — the
+                # layers split flat across cards (~15.5 GB each), then
+                # ExpertOffloader moves the routed-expert stacked tensors
+                # (27 GB) to CPU and pages them per forward. Resident per GPU
+                # drops to ~1 GB + one expert slab (~576 MiB) at a time.
                 from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
-                gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map={"": gpu_id},
+                    path, torch_dtype="auto", device_map="auto",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                self._offloader = ExpertOffloader.install(model, gpu_id=gpu_id)
-                placement = {"mode": "expert_offload", "gpu": gpu_id,
-                             "n_layers": len(model.model.layers)}
+                self._offloader = ExpertOffloader.install(model)
+                placement = {"mode": "expert_offload",
+                             "n_layers": len(model.model.layers),
+                             "hfm": len(getattr(model, "hf_device_map", {}))}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -213,13 +214,23 @@ class ModelManager:
             # single GPU (cuda:<id>) — for MoE we still need offload to fit.
             gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
             if expert_offload and spec.moe:
-                from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
+                # One GPU: 30B doesn't fit even flat, so use the layer-streamer
+                # (pages whole decoder layers). Slow but works on a single card.
+                from src.layer_streamer import LayerStreamer  # noqa: PLC0415
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map={"": gpu_id},
+                    path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                self._offloader = ExpertOffloader.install(model, gpu_id=gpu_id)
-                placement = {"mode": "expert_offload", "gpu": gpu_id}
+                self._streamer = LayerStreamer(model.model, gpu=gpu_id,
+                                               chunk=self._STREAM_CHUNK)
+                self._streamer.install()
+                if hasattr(model, "lm_head") and model.lm_head is not None:
+                    try:
+                        model.lm_head.to(f"cuda:{gpu_id}")
+                    except Exception:
+                        pass
+                placement = {"mode": "layer_stream", "gpu": gpu_id,
+                             "chunk": self._STREAM_CHUNK}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
