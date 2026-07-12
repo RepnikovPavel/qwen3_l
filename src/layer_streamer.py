@@ -47,10 +47,21 @@ class LayerStreamer:
         self.chunk = max(1, chunk)
         self._orig_forward = None
         self._copy_stream = torch.cuda.Stream(device=self.device)
-        # Pinned CPU staging tensors aren't needed: we copy page-locked weights
-        # directly; weights allocated by from_pretrained are pageable, but a
-        # dedicated stream still overlaps most of the transfer with compute.
-        # All layers start on CPU.
+        # Resident small modules stay permanently on the GPU (used every step):
+        #   embed_tokens, rotary_emb, final norm. lm_head lives on the
+        #   Qwen3MoeForCausalLM wrapper (the PARENT of inner_model) — move it too.
+        if hasattr(inner_model, "embed_tokens") and inner_model.embed_tokens is not None:
+            inner_model.embed_tokens.to(self.device)
+        if hasattr(inner_model, "rotary_emb") and inner_model.rotary_emb is not None:
+            inner_model.rotary_emb.to(self.device)
+        if hasattr(inner_model, "norm") and inner_model.norm is not None:
+            inner_model.norm.to(self.device)
+        # inner_model is model.model; its parent is the ForCausalLM with lm_head.
+        parent = getattr(inner_model, "_moeparent", None)
+        if parent is None:
+            # Try to find it: caller should set inner._moeparent = model.
+            pass
+        # All decoder layers start on CPU (paged in/out per forward).
         for layer in self.layers:
             layer.to("cpu", non_blocking=False)
         torch.cuda.synchronize(self.device)

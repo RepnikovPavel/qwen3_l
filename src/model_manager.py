@@ -190,6 +190,13 @@ class ModelManager:
                 self._streamer = LayerStreamer(
                     model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
                 self._streamer.install()
+                # lm_head lives on the ForCausalLM wrapper, not model.model —
+                # move it to the streamer's GPU so logits match the last layer.
+                if hasattr(model, "lm_head") and model.lm_head is not None:
+                    try:
+                        model.lm_head.to(f"cuda:{gpu_id}")
+                    except Exception:
+                        pass
                 placement = {"mode": "layer_stream", "gpu": gpu_id,
                              "chunk": self._STREAM_CHUNK,
                              "n_layers": len(model.model.layers)}
