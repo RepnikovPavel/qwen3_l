@@ -161,11 +161,23 @@ def chat(req: ChatRequest):
 
     def event_stream():
         try:
-            # Inputs go to the first layer's device (model-parallel) or model.device.
+            # Inputs go to the device of the embedding layer:
+            #   - model-parallel (hf_device_map set): first device in the map
+            #   - manual MoE offload / single GPU: check embed_tokens device
+            input_device = None
             if hasattr(model, "hf_device_map") and getattr(model, "hf_device_map", None):
                 input_device = next(iter(model.hf_device_map.values()))
-            else:
-                input_device = model.device
+            if input_device is None:
+                # Walk to where embed_tokens actually lives.
+                embed = getattr(model, "model", model)
+                embed = getattr(embed, "embed_tokens", None)
+                if embed is not None:
+                    try:
+                        input_device = next(embed.parameters()).device
+                    except StopIteration:
+                        input_device = model.device
+                else:
+                    input_device = model.device
             inputs = tokenizer([text], return_tensors="pt").to(input_device)
             n_prompt = inputs.input_ids.shape[1]
 
