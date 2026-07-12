@@ -65,6 +65,10 @@ class ModelManager:
         self._loaded: Optional[LoadedModel] = None
         self._streamer = None      # legacy layer-streamer (unused for MoE now)
         self._offloader = None     # ExpertOffloader for MoE (routed experts on CPU)
+        # Partial-state tracking for cleanup-on-load-failure:
+        self._pending_model = None
+        self._pending_offloader = None
+        self._pending_streamer = None
         self._lock = threading.RLock()  # serializes load/unload/generate
         self._reaper = threading.Thread(target=self._idle_watch, daemon=True)
         self._reaper.start()
@@ -185,36 +189,72 @@ class ModelManager:
         must not leave half-loaded weights holding VRAM/RAM. Catch, run the
         full unload sequence, then re-raise so the caller sees the error.
         """
+        # Track partial state so cleanup can reach a model that was created
+        # but not yet assigned to self._loaded (e.g. from_pretrained succeeded,
+        # then ExpertOffloader.install raised).
+        self._pending_offloader = None
+        self._pending_streamer = None
+        self._pending_model = None
         try:
             return self._do_load_impl(model_id, device, expert_offload)
         except Exception:
-            # Best-effort cleanup of whatever partially-loaded state exists.
-            # Detach offloader/streamer hooks, drop the model, reclaim memory.
-            print("[manager] load failed — cleaning up partial state",
-                  exc_info=True, flush=True)
-            try:
-                if self._offloader is not None:
-                    self._offloader.remove()
-            except Exception:
-                pass
-            self._offloader = None
-            try:
-                if self._streamer is not None:
-                    self._streamer.remove()
-            except Exception:
-                pass
-            self._streamer = None
-            # If a model object was created before the error, move to CPU then del.
+            import traceback as _tb  # noqa: PLC0415
+            print("[manager] load failed — cleaning up partial state\n"
+                  + _tb.format_exc(), flush=True)
             import gc as _gc  # noqa: PLC0415
             import torch as _torch  # noqa: PLC0415
+            # Detach hooks from whatever offloader/streamer got installed.
+            for attr in ("_pending_offloader", "_offloader"):
+                od = getattr(self, attr, None)
+                if od is not None:
+                    try:
+                        od.remove()
+                    except Exception:
+                        pass
+            for attr in ("_pending_streamer", "_streamer"):
+                st = getattr(self, attr, None)
+                if st is not None:
+                    try:
+                        st.remove()
+                    except Exception:
+                        pass
+            # Drop the partially-loaded model (pending OR fully-assigned OR
+            # orphaned inside from_pretrained). The pending_model hook catches
+            # errors AFTER from_pretrained returns; for errors INSIDE it there
+            # is no local ref, so scan gc for any AutoModel that holds CUDA
+            # tensors and detach it.
             lm = self._loaded
             self._loaded = None
+            model = self._pending_model
+            victims = []
             if lm is not None:
+                victims.append(lm.model)
+            if model is not None:
+                victims.append(model)
+            # Fallback: find orphaned model objects still pinning CUDA memory.
+            try:
+                import transformers  # noqa: PLC0415
+                for obj in _gc.get_objects():
+                    if isinstance(obj, transformers.PreTrainedModel):
+                        try:
+                            if any(p.is_cuda for p in obj.parameters()):
+                                victims.append(obj)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            for m in victims:
                 try:
-                    lm.model.to("cpu")
+                    m.to("cpu")
                 except Exception:
                     pass
+            self._pending_model = None
+            self._offloader = None
+            self._streamer = None
+            if lm is not None:
                 del lm
+            for m in victims:
+                del m
             _gc.collect()
             try:
                 if _torch.cuda.is_available():
@@ -257,7 +297,9 @@ class ModelManager:
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
+                self._pending_model = model  # for cleanup if install() fails
                 self._offloader = ExpertOffloader.install(model)
+                self._pending_model = None  # install succeeded; manager owns it now
                 placement = {"mode": "expert_offload",
                              "n_layers": len(model.model.layers)}
                 device = "mp_cpu_offload"
