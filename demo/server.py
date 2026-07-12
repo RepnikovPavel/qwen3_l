@@ -154,15 +154,24 @@ def api_status():
 
 @app.get("/api/memory")
 def api_memory():
-    """Dedicated memory snapshot for the UI's 'how much GPU/CPU we consume' panel."""
-    # Snapshot current ONCE to avoid a TOCTOU race with the idle-watcher that
-    # nulls MANAGER.current between the `is not None` check and the `.spec` read.
-    cur = MANAGER.current
+    """Dedicated memory snapshot for the UI's 'how much GPU/CPU we consume' panel.
+
+    Includes a per-process breakdown of GPU memory: 'ours' (this demo) vs
+    'other' (zombie containers, other users' processes). Lets the UI show
+    exactly who is holding the GPU.
+    """
+    cur = MANAGER.current  # snapshot to avoid race with idle-watcher
+    procs = MANAGER.gpu_processes()
+    ours_mib = sum(p["used_mib"] for p in procs if p["ours"])
+    other_mib = sum(p["used_mib"] for p in procs if not p["ours"])
     return {
         "vram": MANAGER.vram_summary(),
         "ram": MANAGER.ram_summary(),
         "loaded": cur is not None,
         "model_id": cur.spec.id if cur is not None else None,
+        "processes": procs,
+        "ours_vram_mib": round(ours_mib, 1),
+        "other_vram_mib": round(other_mib, 1),
     }
 
 

@@ -37,7 +37,7 @@ from src.models import ModelSpec, get_model  # noqa: E402
 
 # Auto-unload after this many seconds with no requests. Keeps the GPUs free when
 # nobody is talking to the demo. Override via DEMO_IDLE_TIMEOUT env.
-IDLE_TIMEOUT = float(__import__("os").environ.get("DEMO_IDLE_TIMEOUT", "600"))
+IDLE_TIMEOUT = float(__import__("os").environ.get("DEMO_IDLE_TIMEOUT", "300"))
 
 
 @dataclass
@@ -158,6 +158,69 @@ class ModelManager:
             return out
         except Exception as e:  # noqa: BLE001
             return [{"error": f"{type(e).__name__}: {e}"}]
+
+    def gpu_processes(self) -> list[dict]:
+        """Per-process GPU memory breakdown: 'ours' vs 'other'.
+
+        Parses `nvidia-smi --query-compute-apps` to see which PIDs hold VRAM on
+        each GPU. The current process's PID is flagged `ours=True` so the UI
+        can show 'наше потребление' vs 'другие процессы'.
+        """
+        import os  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        our_pid = os.getpid()
+        # Map GPU index -> UUID (nvidia-smi reports uuid for compute-apps).
+        try:
+            uuids = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                text=True, timeout=10,
+            ).strip().splitlines()
+            idx_to_uuid = {}
+            for line in uuids:
+                idx, uuid = [x.strip() for x in line.split(",", 1)]
+                idx_to_uuid[uuid] = int(idx)
+        except Exception:
+            idx_to_uuid = {}
+
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                 "--format=csv,noheader,nounits"],
+                text=True, timeout=10,
+            ).strip().splitlines()
+        except Exception:
+            return []
+
+        procs = []
+        for line in out:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            uuid, pid_s, name, mem_s = parts[:4]
+            try:
+                pid = int(pid_s)
+                # used_memory comes as "1234 MiB" — strip unit.
+                mem_mib = float(mem_s.replace("MiB", "").strip())
+            except ValueError:
+                continue
+            gpu_idx = idx_to_uuid.get(uuid, -1)
+            # Identify the process command line (best-effort).
+            cmd = name
+            try:
+                cmd = subprocess.check_output(
+                    ["ps", "-o", "cmd=", "-p", str(pid)],
+                    text=True, timeout=5,
+                ).strip()[:120]
+            except Exception:
+                pass
+            procs.append({
+                "pid": pid,
+                "gpu": gpu_idx,
+                "used_mib": mem_mib,
+                "ours": pid == our_pid,
+                "cmd": cmd,
+            })
+        return procs
 
     def ram_summary(self) -> dict:
         """Process RSS (resident RAM) + total GPU VRAM, for the UI memory panel."""
@@ -424,7 +487,7 @@ class ModelManager:
     def _idle_watch(self):
         """Background thread: unload when idle longer than IDLE_TIMEOUT."""
         while True:
-            time.sleep(30)
+            time.sleep(15)
             with self._lock:
                 if self._loaded is None:
                     continue

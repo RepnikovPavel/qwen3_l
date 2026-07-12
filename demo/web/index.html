@@ -216,6 +216,23 @@ async function refreshMemory(){
     $('mem-rss').textContent=fmtMiB(ram.rss_mib||0);
     $('mem-total').textContent='VRAM '+(ram.vram_used_mib?fmtMiB(ram.vram_used_mib):'—')+' + RSS '+(ram.rss_mib?fmtMiB(ram.rss_mib):'—');
     $('mem-model').textContent=d.loaded?('модель: '+d.model_id):'модель не загружена';
+    // Process breakdown: ours vs other (show in the gpu list footer).
+    const ours=d.ours_vram_mib||0, other=d.other_vram_mib||0;
+    let procsBox=$('mem-procs');
+    if(!procsBox){
+      procsBox=document.createElement('div');procsBox.id='mem-procs';
+      $('vram-gpus').parentNode.insertBefore(procsBox,$('vram-gpus').nextSibling);
+    }
+    const rows=(d.processes||[]).slice().sort((a,b)=>b.used_mib-a.used_mib);
+    let html=`<div class="ctx-row" style="margin-top:6px"><span style="color:var(--accent2)">▼ мы (демка): <b>${fmtMiB(ours)}</b></span><span style="color:var(--warn)">▼ другие: <b>${fmtMiB(other)}</b></span></div>`;
+    for(const p of rows){
+      const color=p.ours?'var(--accent2)':'var(--warn)';
+      const tag=p.ours?'[наш]':'[чужой]';
+      const cmd=p.cmd?p.cmd.slice(0,70):'';
+      html+=`<div class="gpu-row" style="font-size:10px;color:${color}"><span>${tag} PID ${p.pid} · GPU${p.gpu}</span><span><b>${p.used_mib.toFixed(0)} MiB</b></span></div>`;
+      if(cmd)html+=`<div class="gpu-row" style="font-size:9px;color:var(--muted);margin-top:-2px"><span colspan="2" style="word-break:break-all">${cmd}</span></div>`;
+    }
+    procsBox.innerHTML=html;
   }catch(e){}
 }
 
