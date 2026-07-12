@@ -40,22 +40,28 @@
   aside li .del{color:var(--danger);opacity:0;font-size:14px;padding:0 4px}
   aside li:hover .del{opacity:.7}
   /* Main */
-  main{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);overflow:hidden}
-  .col{background:var(--bg);display:flex;flex-direction:column;min-width:0}
-  .col-head{display:flex;justify-content:space-between;align-items:center;padding:7px 14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);overflow:hidden;min-height:0}
+  .col{background:var(--bg);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+  .col-head{display:flex;justify-content:space-between;align-items:center;padding:7px 14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:12px;color:var(--muted);flex-shrink:0}
   .col-head .title{font-weight:600;color:var(--text);text-transform:uppercase;letter-spacing:.04em}
   .stats{display:flex;gap:10px;align-items:center}
   .stats span b{color:var(--accent2)}
   .stats .tps{color:var(--accent);font-variant-numeric:tabular-nums}
-  .msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+  .msgs{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;display:flex;flex-direction:column;gap:12px;min-height:0}
+  .msg{max-width:100%}
   .msg .role{font-size:11px;color:var(--muted);margin-bottom:3px;text-transform:uppercase}
   .msg.user .bubble{background:var(--panel2);border:1px solid var(--border);padding:8px 12px;border-radius:10px;display:inline-block;white-space:pre-wrap;word-break:break-word}
   .msg.assistant .bubble{white-space:pre-wrap;word-break:break-word}
   .cursor{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:text-bottom;animation:blink 1s steps(2) infinite;margin-left:1px}
   @keyframes blink{50%{opacity:0}}
-  .thinking-box{flex:1;overflow-y:auto;padding:14px;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;color:var(--think);line-height:1.55}
-  .thinking-empty{color:var(--muted);font-style:italic;font-family:inherit}
-  .ctx-panel,.vram-panel{padding:10px 14px;border-top:1px solid var(--border);background:var(--panel)}
+  /* Thinking stream: scrollable list of chunk-cards like chat messages.
+     min-height:0 is REQUIRED so flex can shrink it inside .col (otherwise the
+     content pushes the ctx/vram panels off-screen — the bug from the screenshot). */
+  .thinking-stream{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px;display:flex;flex-direction:column;gap:8px;min-height:0;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55}
+  .think-chunk{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--think);border-radius:6px;padding:8px 10px;color:var(--think);white-space:pre-wrap;word-break:break-word;animation:fadein .25s ease}
+  @keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  .thinking-empty{color:var(--muted);font-style:italic;font-family:inherit;padding:14px}
+  .ctx-panel,.vram-panel{padding:10px 14px;border-top:1px solid var(--border);background:var(--panel);flex-shrink:0}
   .ctx-row{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:3px}
   .ctx-row b{color:var(--text);font-variant-numeric:tabular-nums}
   .bar{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;border:1px solid var(--border);margin-bottom:8px}
@@ -127,7 +133,7 @@
         <span><b id="elapsed">—</b>s</span>
       </span>
     </div>
-    <div class="thinking-box" id="thinking"><span class="thinking-empty">Здесь появится цепочка рассуждений модели…</span></div>
+    <div class="thinking-stream" id="thinking"><span class="thinking-empty">Здесь появится цепочка рассуждений модели…</span></div>
     <div class="ctx-panel">
       <div class="ctx-row"><span>Контекст (KV-кэш)</span><span><b id="ctx-used">0</b> / <span id="ctx-max">0</span> токенов</span></div>
       <div class="bar"><div id="ctx-bar" style="width:0%"></div></div>
@@ -180,8 +186,15 @@ async function boot(){
 $('model-select').addEventListener('change',e=>{
   const opt=e.target.selectedOptions[0];
   const moe=opt&&opt.dataset.moe==='true';
+  // For MoE (30B) the model doesn't fit flat — enable expert offload by DEFAULT
+  // so VRAM has room for a long KV cache. User can still uncheck it.
   $('expert-offload').disabled=!moe;
-  if(!moe)$('expert-offload').checked=false;
+  if(moe){
+    $('expert-offload').checked=true;
+    $('expert-offload').title='MoE: experts go to CPU RAM (paged per call) so the KV cache has room for long context';
+  } else {
+    $('expert-offload').checked=false;
+  }
 });
 
 async function refreshStatus(){
@@ -342,12 +355,42 @@ function handleFrame(line,state){
   else if(obj.type==='ctx')setCtx(obj.used,obj.max,obj.kv_bytes,obj.kv_bytes_per_token*obj.max);
   else if(obj.type==='vram')renderVram(obj.gpus||[]);
   else if(obj.type==='token'){
-    if(obj.phase==='thinking'){state.thinking+=obj.text;const b=$('thinking');b.textContent=state.thinking;b.scrollTop=b.scrollHeight;}
+    if(obj.phase==='thinking'){
+      // Stream as discrete chunk-cards (like chat messages), NOT one blob.
+      state.thinking+=obj.text;
+      appendThinkChunk(obj.text, state);
+    }
     else{state.answer+=obj.text;state.bubble.textContent=state.answer;state.bubble.appendChild(state.cursor);$('msgs').scrollTop=$('msgs').scrollHeight;}
   }
   else if(obj.type==='stats_live'){$('tps-live').textContent=obj.tps.toFixed(2)+' tok/s';$('gen-n').textContent=obj.n;}
   else if(obj.type==='stats'){$('tps-final').textContent=obj.tps.toFixed(2);$('elapsed').textContent=obj.elapsed;}
   else if(obj.type==='error')showError(obj.message);
+}
+
+function appendThinkChunk(text, state){
+  const box=$('thinking');
+  // Remove the "empty" placeholder on first chunk.
+  if(state.firstThink===undefined){
+    box.innerHTML='';
+    state.firstThink=true;
+    state.lastChunk=null;
+    state.chunkBuf='';
+    state.chunkTimer=null;
+  }
+  // Buffer tokens ~120ms or ~40 chars before flushing a card, so we get
+  // readable chunks instead of one card per token.
+  state.chunkBuf+=text;
+  if(state.chunkTimer)clearTimeout(state.chunkTimer);
+  state.chunkTimer=setTimeout(()=>{
+    const t=state.chunkBuf;state.chunkBuf='';
+    if(!t)return;
+    const card=document.createElement('div');
+    card.className='think-chunk';
+    card.textContent=t;
+    box.appendChild(card);
+    box.scrollTop=box.scrollHeight;
+    state.lastChunk=card;
+  },120);
 }
 
 async function attachStream(sessionId){
