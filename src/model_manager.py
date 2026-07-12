@@ -193,6 +193,11 @@ class ModelManager:
                 # outputs.router_logits.
                 if hasattr(model.config, "output_router_logits"):
                     model.config.output_router_logits = False
+                    print("[manager] set config.output_router_logits=False", flush=True)
+                # generation_config may also carry the flag — disable there too.
+                gc = getattr(model, "generation_config", None)
+                if gc is not None and hasattr(gc, "output_router_logits"):
+                    gc.output_router_logits = False
                 gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
                 self._streamer = LayerStreamer(
                     model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
