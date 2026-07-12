@@ -43,11 +43,13 @@ class ExpertOffloader:
         # Capacity in MiB; defaults to leaving ~10 GiB free after the resident
         # non-expert weights. Override via DEMO_EXPERT_CACHE_GIB.
         import os  # noqa: PLC0415
-        self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "10"))
+        self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "13.5"))
         self._cache_used_bytes = 0
-        self._cache_order: list[int] = []  # module ids in LRU order (front=MRU)
+        self._cache_order: list[int] = []  # module ids in LRU order (front=LRU)
         self._on_gpu: set[int] = set()
         self._module_size: dict[int, int] = {}  # module id -> bytes of experts
+        # Direct id -> module object map (avoids linear scan during eviction).
+        self._module_by_id: dict[int, nn.Module] = {}
 
     @classmethod
     def install(cls, model: nn.Module) -> "ExpertOffloader":
@@ -149,6 +151,7 @@ class ExpertOffloader:
                     except RuntimeError:
                         pass  # host OOM on pin — fall back to pageable
                 self._module_size[id(experts)] = mod_bytes
+                self._module_by_id[id(experts)] = experts
                 self._expert_ids_in_order.append(id(experts))
                 # Install paging hooks on this experts module.
                 pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
@@ -173,26 +176,25 @@ class ExpertOffloader:
         self._cache_order.append(mod_id)
 
     def _evict_until_fits(self, need_bytes: int):
-        """Evict least-recently-used expert modules until `need_bytes` free in cache."""
+        """Evict least-recently-used expert modules until `need_bytes` free."""
         cap = self._cache_gib * 1024**3
         while self._cache_used_bytes + need_bytes > cap and self._cache_order:
             victim = self._cache_order.pop(0)  # LRU
-            # Find the module object by id (linear scan over the expert modules).
-            for experts in self._iter_expert_modules():
-                if id(experts) == victim:
-                    sz = self._module_size.get(victim, 0)
-                    for p in experts.parameters():
-                        if p.device.type == "cuda":
-                            # Copy back to (pinned) CPU and free the GPU copy.
-                            cpu = torch.empty(
-                                p.data.shape, dtype=p.data.dtype,
-                                device="cpu", pin_memory=True,
-                            )
-                            cpu.copy_(p.data)
-                            p.data = cpu
-                    self._cache_used_bytes -= sz
-                    self._on_gpu.discard(victim)
-                    break
+            experts = self._module_by_id.get(victim)
+            if experts is None:
+                continue
+            sz = self._module_size.get(victim, 0)
+            for p in experts.parameters():
+                if p.device.type == "cuda":
+                    # Copy back to pinned CPU and free the GPU copy.
+                    cpu = torch.empty(
+                        p.data.shape, dtype=p.data.dtype,
+                        device="cpu", pin_memory=True,
+                    )
+                    cpu.copy_(p.data)
+                    p.data = cpu
+            self._cache_used_bytes -= sz
+            self._on_gpu.discard(victim)
 
     def _make_pre_hook(self, home: str):
         """Page the expert tensors onto their home GPU before the module runs.
@@ -251,18 +253,17 @@ class ExpertOffloader:
             if idx >= 0 and idx + 1 < len(self._expert_ids_in_order):
                 next_id = self._expert_ids_in_order[idx + 1]
                 if next_id not in self._on_gpu:
-                    # Find the next module object and async-copy its params.
-                    for experts in self._iter_expert_modules():
-                        if id(experts) == next_id:
-                            sz = self._module_size.get(next_id, 0)
-                            # Only prefetch if there's room (don't evict for it).
-                            cap = self._cache_gib * 1024**3
-                            if self._cache_used_bytes + sz <= cap:
-                                with torch.cuda.stream(self._prefetch_stream):
-                                    for p in experts.parameters():
-                                        if p.device.type == "cpu":
-                                            p.data = p.data.to("cuda:0",
-                                                non_blocking=True)
+                    experts = self._module_by_id.get(next_id)
+                    if experts is not None:
+                        sz = self._module_size.get(next_id, 0)
+                        # Only prefetch if there's room (don't evict for it).
+                        cap = self._cache_gib * 1024**3
+                        if self._cache_used_bytes + sz <= cap:
+                            with torch.cuda.stream(self._prefetch_stream):
+                                for p in experts.parameters():
+                                    if p.device.type == "cpu":
+                                        p.data = p.data.to("cuda:0",
+                                            non_blocking=True)
                                 # Note: the pre-hook will record it as resident.
                                 # We can't easily mark it here without racing,
                                 # so the pre-hook re-checks device and records.
