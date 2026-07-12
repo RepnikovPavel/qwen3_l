@@ -32,7 +32,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from src.models import ModelSpec, get_model
+from src.layer_streamer import LayerStreamer  # noqa: E402
+from src.models import ModelSpec, get_model  # noqa: E402
 
 # Auto-unload after this many seconds with no requests. Keeps the GPUs free when
 # nobody is talking to the demo. Override via DEMO_IDLE_TIMEOUT env.
@@ -54,20 +55,15 @@ class LoadedModel:
 class ModelManager:
     """Process-global owner of the currently loaded model."""
 
-    # MoE expert offload tuning (30B on 2x16 GB):
-    #   - per-GPU cap leaves room for activations + KV cache during generation
-    #   - large CPU budget accepts all the spilled expert weights (~25 GB)
-    # Override via env if you want to retune for different hardware.
-    _MOE_OFFLOAD_PER_GPU_GIB = int(
-        __import__("os").environ.get("DEMO_MOE_GPU_GIB", "6")
-    )
-    _MOE_OFFLOAD_CPU_GIB = int(
-        __import__("os").environ.get("DEMO_MOE_CPU_GIB", "64")
-    )
+    # Double-buffered layer streaming: number of layers to prefetch ahead on
+    # each GPU. Larger chunk = more VRAM used but better overlap of copy/compute.
+    # Override via env (DEMO_STREAM_CHUNK).
+    _STREAM_CHUNK = int(__import__("os").environ.get("DEMO_STREAM_CHUNK", "2"))
 
     def __init__(self, ckptdir: str):
         self.ckptdir = ckptdir
         self._loaded: Optional[LoadedModel] = None
+        self._streamer: Optional[LayerStreamer] = None
         self._lock = threading.RLock()  # serializes load/unload/generate
         self._reaper = threading.Thread(target=self._idle_watch, daemon=True)
         self._reaper.start()
@@ -180,16 +176,24 @@ class ModelManager:
 
         if device == "mp" and torch.cuda.device_count() >= 2:
             if expert_offload and spec.moe:
-                # FP8 models can't be loaded straight onto a mixed GPU+CPU
-                # device_map (transformers rejects it), so for the big MoE we
-                # load everything to CPU first, then manually place: attention
-                # + shared expert + router split across the two GPUs, expert
-                # weight tensors stay on CPU and page in/out per forward.
+                # FP8 + device_map with CPU is rejected by transformers, so we
+                # load the whole model to CPU and let LayerStreamer page decoder
+                # layers GPU<->CPU with double buffering (async prefetch). This
+                # is what keeps BOTH GPUs busy: layers are assigned round-robin
+                # across cards and prefetched in parallel.
                 model = AutoModelForCausalLM.from_pretrained(
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                placement = self._place_moe_offload_multi_gpu(model)
+                devices = list(range(torch.cuda.device_count()))
+                self._streamer = LayerStreamer.install(
+                    model, devices=devices, chunk=self._STREAM_CHUNK)
+                placement = {
+                    "mode": "layer_stream",
+                    "devices": devices,
+                    "chunk": self._STREAM_CHUNK,
+                    "n_layers": len(model.model.layers),
+                }
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -210,28 +214,14 @@ class ModelManager:
             # single GPU (cuda:<id>) — for MoE we still need offload to fit.
             gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
             if expert_offload and spec.moe:
-                # Load to CPU, then place on the single GPU with experts on CPU.
                 model = AutoModelForCausalLM.from_pretrained(
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                # Move everything except experts to the GPU.
-                for name, module in model.named_modules():
-                    if hasattr(module, "experts") and hasattr(module.experts, "gate_up_proj"):
-                        continue
-                    try:
-                        module.to(f"cuda:{gpu_id}")
-                    except Exception:
-                        pass
-                # Page experts' stacked weights in/out per forward.
-                n = 0
-                for layer in model.model.layers:
-                    experts = getattr(layer.mlp, "experts", None)
-                    if experts is not None and hasattr(experts, "gate_up_proj"):
-                        self._install_expert_hooks_on_module(experts, gpu_id)
-                        n += 1
-                print(f"[manager] single-GPU MoE offload: {n} expert layers paged", flush=True)
-                placement = {"mode": "single_gpu_cpu_offload", "gpu": gpu_id}
+                self._streamer = LayerStreamer.install(
+                    model, devices=[gpu_id], chunk=self._STREAM_CHUNK)
+                placement = {"mode": "layer_stream", "devices": [gpu_id],
+                             "chunk": self._STREAM_CHUNK}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -255,6 +245,13 @@ class ModelManager:
     def _do_unload(self):
         lm = self._loaded
         print(f"[manager] unloading {lm.spec.id} (device={lm.device})", flush=True)
+        # Detach the layer streamer hooks first (if any).
+        if self._streamer is not None:
+            try:
+                self._streamer.remove()
+            except Exception:
+                pass
+            self._streamer = None
         try:
             # Move model to CPU first so VRAM is actually released on .del.
             import torch  # noqa: PLC0415
@@ -274,125 +271,9 @@ class ModelManager:
         self._log_vram("after unload")
 
     # ------------------------------------------------------------- MoE offload
-
-    def _place_moe_offload_multi_gpu(self, model) -> dict:
-        """Place a CPU-loaded MoE model across multiple GPUs with experts on CPU.
-
-        Layout for each decoder layer (Qwen3-MoE):
-          - attention + layernorms + router (gate) + shared expert  -> a GPU
-          - routed experts (the big stacked weight tensors)         -> CPU
-
-        Layers are split evenly: first half on GPU 0, second half on GPU 1.
-        Forward hooks page the expert tensors GPU<-CPU per call (slow but fits).
-
-        Returns a summary placement dict for reporting.
-        """
-        import torch  # noqa: PLC0415
-
-        n_gpus = torch.cuda.device_count()
-        layers = model.model.layers
-        n_layers = len(layers)
-        split = n_layers // n_gpus  # first half -> gpu0, rest -> gpu1
-
-        # Embeddings on GPU 0 (entry point); lm_head + final norm on the LAST
-        # gpu (exit point — logits come from the last layer's device).
-        target_gpu0 = "cuda:0"
-        embed = getattr(model.model, "embed_tokens", None)
-        if embed is not None:
-            embed.to(target_gpu0)
-        last_gpu = n_gpus - 1
-        target_last = f"cuda:{last_gpu}"
-        if hasattr(model, "lm_head") and model.lm_head is not None:
-            model.lm_head.to(target_last)
-        if hasattr(model.model, "norm"):
-            model.model.norm.to(target_last)
-
-        offload_layers = 0
-        layer_devices: list[int] = []
-        for i, layer in enumerate(layers):
-            gpu_id = 0 if i < split else 1
-            target = f"cuda:{gpu_id}"
-            layer_devices.append(gpu_id)
-            # Move the layer to the GPU, then push experts back to CPU.
-            layer.to(target)
-            experts = getattr(layer.mlp, "experts", None)
-            shared = getattr(layer.mlp, "shared_expert", None)
-            gate = getattr(layer.mlp, "gate", None)
-            # Router + shared expert stay on GPU.
-            if gate is not None:
-                gate.to(target)
-            if shared is not None:
-                shared.to(target)
-            # Routed experts: keep on CPU, install page-in/out hooks.
-            if experts is not None and hasattr(experts, "gate_up_proj"):
-                for p in experts.parameters():
-                    p.data = p.data.to("cpu")
-                self._install_expert_hooks_on_module(experts, gpu_id)
-                offload_layers += 1
-            # Cross-GPU bridge: when the layer's output flows to the next layer
-            # on a different GPU, activations must hop across. accelerate does
-            # this via hooks with device_map="auto"; we replicate it manually.
-            self._install_layer_device_bridge(layer, gpu_id)
-
-        # The final model.norm + lm_head were already placed on the last GPU
-        # above (exit point). The per-layer pre-hook moves activations onto
-        # each layer's device, so the GPU0->GPU1 boundary at the layer split is
-        # bridged automatically.
-
-        print(f"[manager] MoE offload placed: layers split across {n_gpus} GPUs, "
-              f"{offload_layers} layers' experts on CPU", flush=True)
-        return {
-            "mode": "mp_cpu_offload",
-            "n_gpus": n_gpus,
-            "layer_split": f"0-{split-1} on gpu0, {split}-{n_layers-1} on gpu1",
-            "offloaded_expert_layers": offload_layers,
-        }
-
-    def _install_layer_device_bridge(self, layer, gpu_id):
-        """Pre-hook: move any incoming tensor args/buffers onto cuda:<gpu_id>.
-
-        This is what makes manual multi-GPU placement work without accelerate's
-        device_map hooks: each layer forces its inputs onto its own device, so
-        activations flow GPU0 -> GPU1 cleanly at the layer boundary.
-        """
-        import torch  # noqa: PLC0415
-
-        target = f"cuda:{gpu_id}"
-
-        def pre(_module, args, kwargs):
-            def _move(x):
-                if isinstance(x, torch.Tensor) and x.device.type == "cuda" \
-                        and str(x.device) != target:
-                    return x.to(target)
-                return x
-            new_args = []
-            for a in args:
-                if isinstance(a, tuple):
-                    new_args.append(tuple(_move(t) for t in a))
-                else:
-                    new_args.append(_move(a))
-            if kwargs:
-                kwargs = {k: _move(v) for k, v in kwargs.items()}
-            return tuple(new_args), kwargs
-
-        layer.register_forward_pre_hook(pre, with_kwargs=True)
-
-    def _install_expert_hooks_on_module(self, experts_module, gpu_id):
-        """Register forward pre/post hooks paging the expert tensors GPU<->CPU."""
-        import torch  # noqa: PLC0415
-
-        def pre(_m, _args):
-            for p in _m.parameters():
-                if p.device.type == "cpu":
-                    p.data = p.data.to(f"cuda:{gpu_id}", non_blocking=False)
-
-        def post(_m, _args, _output):
-            for p in _m.parameters():
-                if p.device.type != "cpu":
-                    p.data = p.data.to("cpu", non_blocking=False)
-
-        experts_module.register_forward_pre_hook(pre)
-        experts_module.register_forward_hook(post)
+    # (Replaced by src/layer_streamer.py — double-buffered layer paging that
+    # keeps both GPUs busy. The old per-expert hooks + manual device bridge are
+    # gone; LayerStreamer installs forward pre-hooks on every decoder layer.)
 
     # --------------------------------------------------------------- internals
 
