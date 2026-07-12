@@ -176,7 +176,9 @@ class LayerStreamer:
             # from the previous iteration's prefetch; first chunk was pre-staged).
             move(current, self.device)
 
-            # Compute the current chunk.
+            # Compute the current chunk. Ask MoE layers to return router_logits
+            # (output_router_logits=True) so Qwen3MoeForCausalLM.forward finds
+            # them in the aggregated model output.
             for layer in current:
                 out = layer(
                     hidden_states,
@@ -186,20 +188,19 @@ class LayerStreamer:
                     position_embeddings=position_embeddings,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    output_router_logits=True,
                     **kwargs,
                 )
-                # Layer may return a tuple (hidden, ...) or a dataclass.
+                # Layers return a tuple (hidden_states, attn_or_router...) or a
+                # dataclass; extract hidden + any router_logits tensor.
                 if isinstance(out, tuple):
                     hidden_states = out[0]
-                    # MoE tuples may carry router_logits at a known index.
                     for item in out[1:]:
-                        if hasattr(item, "router_logits") or (
-                            torch.is_tensor(item) and item.dim() == 2
-                            and item.shape[0] == hidden_states.shape[1]
-                        ):
-                            router_logits_all.append(
-                                item.router_logits if hasattr(item, "router_logits") else item
-                            )
+                        # router_logits is a (batch*seq, num_experts) tensor.
+                        if torch.is_tensor(item) and item.dim() == 2:
+                            router_logits_all.append(item)
+                        elif hasattr(item, "router_logits") and item.router_logits is not None:
+                            router_logits_all.append(item.router_logits)
                 else:
                     hidden_states = getattr(out, "last_hidden_state", out)
                     rl = getattr(out, "router_logits", None)
@@ -211,17 +212,12 @@ class LayerStreamer:
                 move(current, "cpu")
 
         hidden_states = inner_self.norm(hidden_states)
-        # MoE generate() expects router_logits in the model output; use the
-        # MoE output dataclass when we collected any, else the plain one.
-        if router_logits_all:
-            from transformers.modeling_outputs import MoeModelOutputWithPast  # noqa: PLC0415
-            return MoeModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-                router_logits=tuple(router_logits_all),
-            )
-        from transformers.modeling_outputs import BaseModelOutputWithPast  # noqa: PLC0415
-        return BaseModelOutputWithPast(
+        # For MoE, ALWAYS return MoeModelOutputWithPast (even if router_logits
+        # came back empty) — Qwen3MoeForCausalLM.forward reads the attribute
+        # unconditionally when output_router_logits is on.
+        from transformers.modeling_outputs import MoeModelOutputWithPast  # noqa: PLC0415
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+            router_logits=tuple(router_logits_all) if router_logits_all else None,
         )
