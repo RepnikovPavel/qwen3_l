@@ -2,37 +2,43 @@
 Qwen3-4B-Thinking-2507-FP8 benchmark: parallel multi-GPU + CPU + consistency.
 
 Design:
-  - One worker process per GPU, launched simultaneously so every GPU is driven
+  - One worker PROCESS per GPU, launched simultaneously so every GPU is driven
     to 100% in parallel. Each worker loads its own model copy on cuda:<id>.
   - One CPU worker: dequantizes FP8 → bf16 and runs purely on the host CPU.
   - Consistency check: every worker runs the SAME prompt with greedy decoding
     (do_sample=False, fixed seed), so the output token ids must be identical
     across devices. We compare them pairwise and report match / mismatch.
 
-Workers communicate results back via a multiprocessing Queue. This keeps the
-run resilient: one worker crashing (e.g. OOM) doesn't take down the others.
+CRITICAL: uses the 'spawn' multiprocessing start method. The default 'fork'
+breaks CUDA ("Cannot re-initialize CUDA in forked subprocess"), and even the
+main process must not touch torch.cuda before spawning — GPU discovery is done
+inside the workers, and the main process only orchestrates.
 
 Usage:
     python -m bench.bench --ckptdir /path/to/hf                    # auto: all GPUs + CPU
     python -m bench.bench --ckptdir /path/to/hf --no-cpu           # GPUs only
     python -m bench.bench --ckptdir /path/to/hf --gpus 0 1         # specific GPUs
+    python -m bench.bench --ckptdir /path/to/hf --mp               # model-parallel
     python -m bench.bench --ckptdir /path/to/hf --max_new_tokens 2048
 """
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import sys
 import traceback
 from pathlib import Path
-from multiprocessing import Process, Queue
+
+# 'spawn' MUST be set before any torch import anywhere — fork breaks CUDA.
+mp.set_start_method("spawn", force=True)
 
 # Make `src` importable when running bench/ directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _gpu_worker(gpu_id: int, ckptdir: str, prompt: str, max_new_tokens: int,
-                seed: int, q: Queue):
+                seed: int, q):
     """Worker: load model on cuda:<gpu_id> and run one generation."""
     try:
         import torch  # noqa: PLC0415
@@ -40,10 +46,13 @@ def _gpu_worker(gpu_id: int, ckptdir: str, prompt: str, max_new_tokens: int,
         torch.cuda.set_device(gpu_id)
         from src.inference import generate, load_model  # noqa: PLC0415
 
+        name = torch.cuda.get_device_name(gpu_id)
+        cap = torch.cuda.get_device_capability(gpu_id)[0]
+        print(f"[worker cuda:{gpu_id}] {name} (SM{cap})", flush=True)
+
         tokenizer, model = load_model(ckptdir, "cuda", gpu_id=gpu_id)
         res = generate(tokenizer, model, prompt, max_new_tokens, "cuda", seed)
 
-        # Peak GPU memory during generation.
         mem_peak_mb = torch.cuda.max_memory_allocated(gpu_id) / 1024 / 1024
 
         q.put({
@@ -57,7 +66,7 @@ def _gpu_worker(gpu_id: int, ckptdir: str, prompt: str, max_new_tokens: int,
             "new_tokens": res["n_new"],
             "elapsed_s": round(res["elapsed_s"], 2),
             "mem_peak_mb": round(mem_peak_mb, 1),
-            "torch_cuda": torch.version.cuda,
+            "gpu_name": name,
         })
     except Exception as e:  # noqa: BLE001
         q.put({"worker": f"cuda:{gpu_id}", "device": "cuda", "gpu_id": gpu_id,
@@ -66,7 +75,7 @@ def _gpu_worker(gpu_id: int, ckptdir: str, prompt: str, max_new_tokens: int,
 
 
 def _mp_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
-               max_memory: dict | None, q: Queue):
+               max_memory, q):
     """Worker: one model split across all visible GPUs (model-parallel).
 
     Trades per-token latency for a larger effective memory pool, so a bigger
@@ -80,7 +89,6 @@ def _mp_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
         tokenizer, model = load_model(ckptdir, "mp", max_memory=max_memory)
         res = generate(tokenizer, model, prompt, max_new_tokens, "mp", seed)
 
-        # Peak memory per GPU.
         mem = {}
         for g in range(torch.cuda.device_count()):
             mem[g] = round(torch.cuda.max_memory_allocated(g) / 1024 / 1024, 1)
@@ -104,7 +112,7 @@ def _mp_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
 
 
 def _cpu_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
-                n_threads: int, q: Queue):
+                n_threads: int, q):
     """Worker: dequantize FP8 → bf16 and run on CPU."""
     try:
         import torch  # noqa: PLC0415
@@ -134,18 +142,42 @@ def _cpu_worker(ckptdir: str, prompt: str, max_new_tokens: int, seed: int,
                "traceback": traceback.format_exc()})
 
 
-def _consistency_report(results: list[dict]) -> list[str]:
-    """Compare output_ids across all successful workers, pairwise.
+def _discover_gpus(gpu_ids):
+    """Discover GPUs WITHOUT initializing CUDA in the parent.
 
-    Returns a list of human-readable match/mismatch lines.
+    nvidia-smi gives the count/names without touching the CUDA runtime, so the
+    'spawn' workers can initialize CUDA cleanly. Falls back gracefully.
     """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,name,compute_cap", "--format=csv,noheader,nounits"],
+            text=True, timeout=15,
+        ).strip().splitlines()
+        all_gpus = []
+        for line in out:
+            idx, name, cap = [x.strip() for x in line.split(",")]
+            all_gpus.append((int(idx), name, cap))
+    except Exception as e:  # noqa: BLE001
+        print(f"[plan] nvidia-smi unavailable ({e})", flush=True)
+        return []
+
+    if gpu_ids is None:
+        chosen = all_gpus
+    else:
+        chosen = [g for g in all_gpus if g[0] in gpu_ids]
+    return chosen
+
+
+def _consistency_report(results: list[dict]) -> list[str]:
+    """Compare output_ids across all successful workers, pairwise."""
     ok = [r for r in results if r.get("ok")]
     lines = []
     if len(ok) < 2:
         lines.append(f"only {len(ok)} successful worker(s) — no comparison possible")
         return lines
 
-    # Pick a reference (first successful worker) and compare everyone to it.
     ref = ok[0]
     ref_ids = ref["output_ids"]
     lines.append(f"reference: {ref['worker']} ({len(ref_ids)} tokens)")
@@ -183,25 +215,13 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="path to write JSON results")
     args = parser.parse_args()
 
-    # Discover GPUs.
-    gpu_ids = []
-    n_gpus = 0
-    if not args.no_gpu:
-        try:
-            import torch  # noqa: PLC0415
+    # Discover GPUs via nvidia-smi (no CUDA init in parent → spawn-safe).
+    discovered = [] if args.no_gpu else _discover_gpus(args.gpus)
+    for idx, name, cap in discovered:
+        print(f"[plan] GPU {idx}: {name} (SM{cap.split('.')[0]})", flush=True)
+    gpu_ids = [g[0] for g in discovered]
+    n_gpus = len(gpu_ids)
 
-            n_gpus = torch.cuda.device_count()
-            gpu_ids = args.gpus if args.gpus is not None else list(range(n_gpus))
-            for g in gpu_ids:
-                print(f"[plan] GPU {g}: {torch.cuda.get_device_name(g)} "
-                      f"(SM{torch.cuda.get_device_capability(g)[0]})", flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[plan] CUDA unavailable ({e}); GPU workers disabled", flush=True)
-            gpu_ids = []
-
-    # Mode resolution: --mp uses one model across all GPUs; otherwise launch one
-    # worker per GPU in parallel. The two are mutually exclusive (they would
-    # fight for the same cards).
     use_mp = args.mp and n_gpus >= 2
     if args.mp and n_gpus < 2:
         print(f"[plan] --mp requested but only {n_gpus} GPU(s) found; falling back to parallel mode", flush=True)
@@ -217,26 +237,25 @@ def main():
             dev, mem = part.split(":")
             max_memory[int(dev)] = mem
 
-    q: Queue = Queue()
+    # Use a spawn-compatible Queue.
+    q = mp.Queue()
     procs = []
     if use_mp:
-        p = Process(target=_mp_worker,
-                    args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
-                          max_memory, q))
+        p = mp.Process(target=_mp_worker,
+                       args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
+                             max_memory, q))
         p.start()
         procs.append(p)
     else:
-        # Parallel: one worker per GPU, launched simultaneously so every GPU is
-        # driven to 100%. The CPU worker also runs concurrently.
         for g in gpu_ids:
-            p = Process(target=_gpu_worker,
-                        args=(g, args.ckptdir, args.prompt, args.max_new_tokens, args.seed, q))
+            p = mp.Process(target=_gpu_worker,
+                           args=(g, args.ckptdir, args.prompt, args.max_new_tokens, args.seed, q))
             p.start()
             procs.append(p)
     if run_cpu:
-        p = Process(target=_cpu_worker,
-                    args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
-                          args.cpu_threads, q))
+        p = mp.Process(target=_cpu_worker,
+                       args=(args.ckptdir, args.prompt, args.max_new_tokens, args.seed,
+                             args.cpu_threads, q))
         p.start()
         procs.append(p)
 
@@ -261,7 +280,7 @@ def main():
             continue
         if r["device"] == "cuda":
             gpu_tps.append(r["tokens_per_s"])
-            print(f"[OK] {r['worker']}: {r['tokens_per_s']} tok/s | "
+            print(f"[OK] {r['worker']} ({r.get('gpu_name','?')}): {r['tokens_per_s']} tok/s | "
                   f"{r['new_tokens']} tok in {r['elapsed_s']}s | "
                   f"mem {r['mem_peak_mb']} MB")
         elif r["device"] == "mp":
@@ -275,8 +294,7 @@ def main():
                   f"{r['new_tokens']} tok in {r['elapsed_s']}s | "
                   f"{r['num_threads']} threads")
 
-    # For the README table: aggregate per-GPU throughput. If multiple GPUs ran
-    # in parallel, report each plus the aggregate.
+    # For the README table: aggregate per-GPU throughput.
     print("-" * 70)
     print("CPU↔GPU consistency check:")
     for line in _consistency_report(results):
@@ -295,7 +313,6 @@ def main():
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        # Drop raw output_ids from the saved JSON to keep it small.
         slim = []
         for r in results:
             rr = {k: v for k, v in r.items() if k != "output_ids"}
