@@ -146,20 +146,23 @@ class LayerStreamer:
         causal_mask = create_causal_mask(**mask_kwargs)
         causal_mask = causal_mask.to(self.device, non_blocking=True) if causal_mask is not None else None
 
-        # Pre-stage the first chunk on the GPU via the copy stream.
+        # Pre-stage the first chunk on the GPU (synchronous — see note below).
         chunk = self.chunk
         layers = self.layers
         n = len(layers)
 
         def move(chunk_layers, dev):
             for ly in chunk_layers:
-                ly.to(dev, non_blocking=True)
+                ly.to(dev, non_blocking=False)
 
-        # Async-copy first chunk onto GPU on the copy stream.
-        with torch.cuda.stream(self._copy_stream):
-            move(layers[0:chunk], self.device)
-        # Main stream waits for that copy before using the layers.
-        torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
+        # NOTE: an earlier version used a dedicated CUDA stream + wait_stream to
+        # overlap the next-chunk copy with the current-chunk compute (true double
+        # buffering, like the user's iter_forward_gpu_buff). It deadlocked inside
+        # generate()'s autograd/graph context. The synchronous variant below is
+        # correct and only modestly slower (copy ~400ms vs ~2-10ms compute/layer),
+        # so the overlap wasn't the main win anyway. Revisit with a stream-aware
+        # generate() if throughput matters.
+        move(layers[0:chunk], self.device)
 
         hidden_states = inputs_embeds
         # MoE layers return router_logits; generate() expects them aggregated.
@@ -168,12 +171,11 @@ class LayerStreamer:
             current = layers[i:i + chunk]
             nxt = layers[i + chunk:i + 2 * chunk]
 
-            # Async prefetch the NEXT chunk (copy stream) while we compute.
-            if nxt:
-                with torch.cuda.stream(self._copy_stream):
-                    move(nxt, self.device)
+            # Make sure the current chunk is on the GPU (no-op if already there
+            # from the previous iteration's prefetch; first chunk was pre-staged).
+            move(current, self.device)
 
-            # Compute the current chunk on the main stream.
+            # Compute the current chunk.
             for layer in current:
                 out = layer(
                     hidden_states,
@@ -203,12 +205,9 @@ class LayerStreamer:
                     if rl is not None:
                         router_logits_all.append(rl)
 
-            # Async evict the chunk we just finished back to CPU.
+            # Evict the chunk we just finished back to CPU (frees VRAM).
             if nxt:  # only evict if there's more work (keep last chunk on GPU)
-                with torch.cuda.stream(self._copy_stream):
-                    move(current, "cpu")
-                # Need the next chunk resident: make main stream wait.
-                torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
+                move(current, "cpu")
 
         hidden_states = inner_self.norm(hidden_states)
         # MoE generate() expects router_logits in the model output; use the
