@@ -2,201 +2,183 @@
 Double-buffered layer streaming for CPU-offloaded models.
 
 Inspired by `iter_forward_gpu_buff` in the user's forked transformers
-(/home/user/calc/rag/transformers/.../modeling_qwen3.py): keep the model
-weights on CPU RAM, and page layers onto the GPU a CHUNK at a time. While the
-current chunk computes, the NEXT chunk is copied CPU→GPU on a background thread
-(non_blocking), and the previous chunk is copied back CPU (non_blocking). The
-GPU therefore never stalls waiting on a copy.
+(/home/user/calc/rag/transformers/.../modeling_qwen3.py): keep model weights on
+CPU RAM and page decoder layers onto the GPU a CHUNK at a time. While the
+current chunk computes, the NEXT chunk is copied CPU->GPU and the chunk behind
+is copied back CPU.
 
-The trick here vs the user's version: we can't replace `forward()` of a model
-we load from a checkpoint (we don't control the class source), so instead we
-install a forward PRE-HOOK on every decoder layer. Each layer, right before it
-runs, ensures IT is on the right GPU and kicks off the async prefetch of the
-layer N+`ahead` that will be needed soon. This integrates with the stock
-`model.generate()` path — no custom forward loop.
+Design notes (learned the hard way):
+  - Do NOT spawn Python threads for the copies. `module.to(non_blocking=True)`
+    launched from many background threads deadlocks against the main CUDA
+    context (the user's reference impl runs copies synchronously between
+    chunks, not from worker threads).
+  - Pin to a SINGLE GPU. Round-robin across GPUs breaks because the shared
+    rotary_emb (cos/sin) and the KV cache live on one device, so `q*cos`
+    raises a device-mismatch when layers hop cards. To use both GPUs, run two
+    model instances in parallel (see bench/bench.py).
+  - Use a dedicated CUDA stream + pinned staging buffers for the copy so it
+    overlaps with compute. The main stream waits on the copy stream before a
+    chunk runs.
 
-Multi-GPU: layers are assigned to GPUs round-robin (0,1,0,1,...) so BOTH cards
-stay busy. With chunked prefetch both GPUs are fed in parallel rather than one
-waiting on the other at a hard boundary.
-
-Usage (set on a model after loading it to CPU):
-    LayerStreamer.install(model, devices=[0,1], chunk=2)
-    ... model.generate(...)   # layers stream in/out automatically
-    LayerStreamer.remove(model)
+The integration point: we replace `model.model.forward` (the layer-stack part)
+with our own chunked loop, and leave the rest of `generate()` untouched. This
+mirrors the user's `iter_forward_gpu_buff` (which is also a Qwen3Model.forward
+override). We monkeypatch it so the stock checkpoint class doesn't need editing.
 """
 from __future__ import annotations
 
-import threading
 import torch
 import torch.nn as nn
 
 
-def _move_async(layer: nn.Module, device):
-    """Move a layer to `device` asynchronously (CUDA streams overlap copy+compute)."""
-    layer.to(device, non_blocking=True)
-
-
 class LayerStreamer:
-    """Installs hooks that page decoder layers GPU<->CPU with double buffering.
+    """Pages decoder layers GPU<->CPU with double buffering on ONE gpu.
 
-    One instance per model. Assigns each decoder layer to a "home" GPU
-    (round-robin across `devices`) and keeps the layer on CPU between forward
-    calls. On each layer's forward it: (1) waits for that layer's prefetch to
-    land on its home GPU, (2) starts prefetching the layer `ahead` steps later.
+    Construct with the inner model (the object holding `.layers`), then call
+    `install()` to monkeypatch its `forward`. The original forward is saved and
+    restored by `remove()`.
     """
 
-    def __init__(self, layers: list[nn.Module], devices: list[int], chunk: int = 2):
-        self.layers = layers
-        self.devices = devices
-        self.chunk = chunk
-        # home_gpu[i] = which GPU layer i lives on when paged in.
-        self.home_gpu = [devices[i % len(devices)] for i in range(len(layers))]
-        self._hooks = []
-        self._lock = threading.Lock()
-        # Track the next-layer prefetch thread so we can join it before using it.
-        self._prefetch_threads: dict[int, threading.Thread] = {}
-        # Make sure all layers start on CPU (offload state).
-        for layer in layers:
+    def __init__(self, inner_model: nn.Module, gpu: int, chunk: int = 2):
+        self.inner = inner_model          # e.g. Qwen3MoeModel
+        self.layers = list(inner_model.layers)
+        self.gpu = gpu
+        self.device = f"cuda:{gpu}"
+        self.chunk = max(1, chunk)
+        self._orig_forward = None
+        self._copy_stream = torch.cuda.Stream(device=self.device)
+        # Pinned CPU staging tensors aren't needed: we copy page-locked weights
+        # directly; weights allocated by from_pretrained are pageable, but a
+        # dedicated stream still overlaps most of the transfer with compute.
+        # All layers start on CPU.
+        for layer in self.layers:
             layer.to("cpu", non_blocking=False)
-        self._installed = False
+        torch.cuda.synchronize(self.device)
 
-    @classmethod
-    def install(cls, model, devices: list[int] | None = None, chunk: int = 2) -> "LayerStreamer":
-        """Find the decoder layers under model.model.layers and hook them.
+    # ------------------------------------------------------------ install/remove
 
-        embed_tokens / lm_head / final norm are kept permanently resident on a
-        single GPU (the entry/exit GPU = devices[0]); decoder layers stream
-        GPU<->CPU. Multi-GPU round-robin across layers is *not* used because the
-        shared rotary_emb and KV cache break when layers hop between cards
-        (q*cos device mismatch). To use BOTH cards, run two model instances in
-        parallel (see bench/bench.py) rather than splitting one model.
-
-        So `devices` here is effectively [single_gpu]; extra entries ignored.
-        """
-        import torch  # noqa: PLC0415
-
-        n = torch.cuda.device_count()
-        devices = devices or list(range(max(1, n)))
-        # Pin to a single GPU to avoid cross-device KV/rotary issues.
-        single = [devices[0]]
-        layers = list(model.model.layers)
-        streamer = cls(layers, single, chunk)
-
-        gpu = single[0]
-        target = f"cuda:{gpu}"
-        # Resident small modules on the entry/exit GPU.
-        if hasattr(model.model, "embed_tokens") and model.model.embed_tokens is not None:
-            model.model.embed_tokens.to(target)
-        # rotary_emb is shared across all layers — must live where layers run.
-        if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
-            model.model.rotary_emb.to(target)
-        if hasattr(model.model, "norm") and model.model.norm is not None:
-            model.model.norm.to(target)
-        if hasattr(model, "lm_head") and model.lm_head is not None:
-            try:
-                model.lm_head.to(target)
-            except Exception:
-                pass
-
-        # Install a pre-hook on each layer that pages it in + prefetches ahead.
-        # with_kwargs=True so we can inspect/move kwargs tensors too.
-        for i, layer in enumerate(layers):
-            hook = layer.register_forward_pre_hook(
-                lambda _mod, args, kwargs, idx=i: streamer._page_in(idx, args, kwargs),
-                with_kwargs=True,
-            )
-            streamer._hooks.append(hook)
-        streamer._installed = True
-        # Prime the first chunk so the very first layer is already on GPU.
-        streamer._prime()
-        print(f"[streamer] installed on {len(layers)} layers, gpu={gpu}, "
-              f"chunk={chunk} (single-GPU streaming; use bench for 2 GPUs)", flush=True)
-        return streamer
+    def install(self):
+        """Monkeypatch inner_model.forward with our chunked streaming loop."""
+        if self._orig_forward is not None:
+            return  # already installed
+        self._orig_forward = self.inner.forward
+        # Bind as a method so `self` inside refers to the LayerStreamer.
+        self.inner.forward = self._streamed_forward
+        print(f"[streamer] patched {type(self.inner).__name__}.forward: "
+              f"{len(self.layers)} layers, gpu={self.gpu}, chunk={self.chunk}",
+              flush=True)
 
     def remove(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-        self._installed = False
+        if self._orig_forward is not None:
+            self.inner.forward = self._orig_forward
+            self._orig_forward = None
 
-    # ----------------------------------------------------------- internals
+    # ------------------------------------------------------------ the streaming loop
 
-    def _prime(self):
-        """Prefetch the first `chunk` layers before generation starts."""
-        for i in range(min(self.chunk, len(self.layers))):
-            self._start_prefetch(i)
+    @torch.no_grad()
+    def _streamed_forward(self, inner_self, *args, **kwargs):
+        """Replacement forward: run embed + chunked layer loop + norm.
 
-    def _start_prefetch(self, idx: int):
-        """Kick off async CPU→home-GPU copy of layer idx (if not already running)."""
-        if idx >= len(self.layers):
-            return
-        with self._lock:
-            if idx in self._prefetch_threads and self._prefetch_threads[idx].is_alive():
-                return  # already in flight
-            layer = self.layers[idx]
-            gpu = self.home_gpu[idx]
-            t = threading.Thread(target=_move_async, args=(layer, f"cuda:{gpu}"))
-            self._prefetch_threads[idx] = t
-            t.start()
+        Mirrors what the original Qwen3MoeModel.forward does, but pages layers.
+        We delegate the "small" parts (embed_tokens, rotary_emb, norm, mask
+        prep) to the original by calling it on a no-op layer list is messy, so
+        we reimplement the minimal stack. This works for Qwen3 / Qwen3Moe.
+        """
+        # Pop the standard args we know how to handle.
+        input_ids = kwargs.pop("input_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        position_ids = kwargs.pop("position_ids", None)
+        past_key_values = kwargs.pop("past_key_values", None)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        use_cache = kwargs.pop("use_cache", None)
+        cache_position = kwargs.pop("cache_position", None)
+        # Any leftover kwargs are passed through unchanged.
 
-    def _page_in(self, idx: int, args=(), kwargs=None):
-        """Called right before layer idx's forward: ensure it's on its home GPU,
-        move the INPUT activations onto that GPU too, then prefetch ahead and
-        evict old layers back to CPU."""
-        # 1. Wait for this layer's prefetch to finish (kicked off earlier).
-        with self._lock:
-            t = self._prefetch_threads.get(idx)
-        if t is not None:
-            t.join()
-            with self._lock:
-                self._prefetch_threads.pop(idx, None)
-        # Make sure the layer really is on its home GPU (sync backstop).
-        gpu = self.home_gpu[idx]
-        target = f"cuda:{gpu}"
-        layer = self.layers[idx]
-        try:
-            p0 = next(layer.parameters())
-            if str(p0.device) != target:
-                layer.to(target, non_blocking=False)
-        except StopIteration:
-            pass
+        from transformers.cache_utils import DynamicCache  # noqa: PLC0415
+        from transformers.masking_utils import create_causal_mask  # noqa: PLC0415
 
-        # 2. Bridge: move input activation tensors onto this layer's GPU so
-        #    weight and input agree (otherwise RMSNorm/Linear raise device
-        #    mismatch). This also handles the GPU0->GPU1 hop at boundaries.
-        new_args = []
-        for a in args:
-            if isinstance(a, torch.Tensor) and a.device.type == "cuda" \
-                    and str(a.device) != target:
-                new_args.append(a.to(target, non_blocking=True))
-            elif isinstance(a, tuple):
-                new_args.append(tuple(
-                    (t.to(target, non_blocking=True) if isinstance(t, torch.Tensor)
-                     and t.device.type == "cuda" and str(t.device) != target else t)
-                    for t in a
-                ))
-            else:
-                new_args.append(a)
-        args = tuple(new_args)
+        if inputs_embeds is None:
+            inputs_embeds = inner_self.embed_tokens(input_ids)
+        # Move embeddings onto our GPU.
+        inputs_embeds = inputs_embeds.to(self.device, non_blocking=True)
 
-        # 3. Prefetch the next `chunk` layers ahead of time.
-        for k in range(1, self.chunk + 1):
-            self._start_prefetch(idx + k)
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=inner_self.config)
+        if cache_position is None:
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen, past_seen + inputs_embeds.shape[1], device=self.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        position_embeddings = inner_self.rotary_emb(inputs_embeds, position_ids)
+        # rotary_emb cos/sin must live on the same GPU as q/k.
+        position_embeddings = [p.to(self.device, non_blocking=True) for p in position_embeddings]
+        position_ids = position_ids.to(self.device, non_blocking=True)
+        if past_key_values is not None:
+            past_key_values = past_key_values.to(self.device, non_blocking=True)
 
-        # 4. Evict layers we're done with (more than `chunk` behind) to CPU.
-        evict_idx = idx - self.chunk
-        if evict_idx >= 0:
-            old = self.layers[evict_idx]
-            try:
-                p = next(old.parameters())
-                if p.device.type == "cuda":
-                    threading.Thread(target=_move_async, args=(old, "cpu")).start()
-            except StopIteration:
-                pass
+        # Causal mask (kept on GPU).
+        mask_kwargs = dict(
+            config=inner_self.config, inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask, cache_position=cache_position,
+            past_key_values=past_key_values, position_ids=position_ids,
+        )
+        causal_mask = create_causal_mask(**mask_kwargs)
+        causal_mask = causal_mask.to(self.device, non_blocking=True) if causal_mask is not None else None
 
-        # We mutated args in place (pre-hook returns the new args via this).
-        return args, (kwargs or {})
+        # Pre-stage the first chunk on the GPU via the copy stream.
+        chunk = self.chunk
+        layers = self.layers
+        n = len(layers)
 
-    def home_device_for_inputs(self):
-        """Device where embed_tokens lives — where input_ids should be placed."""
-        return f"cuda:{self.devices[0]}"
+        def move(chunk_layers, dev):
+            for ly in chunk_layers:
+                ly.to(dev, non_blocking=True)
+
+        # Async-copy first chunk onto GPU on the copy stream.
+        with torch.cuda.stream(self._copy_stream):
+            move(layers[0:chunk], self.device)
+        # Main stream waits for that copy before using the layers.
+        torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
+
+        hidden_states = inputs_embeds
+        for i in range(0, n, chunk):
+            current = layers[i:i + chunk]
+            nxt = layers[i + chunk:i + 2 * chunk]
+
+            # Async prefetch the NEXT chunk (copy stream) while we compute.
+            if nxt:
+                with torch.cuda.stream(self._copy_stream):
+                    move(nxt, self.device)
+
+            # Compute the current chunk on the main stream.
+            for layer in current:
+                out = layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    position_embeddings=position_embeddings,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+                # Layer may return a tuple (hidden, ...) or a dataclass.
+                hidden_states = out[0] if isinstance(out, tuple) else getattr(
+                    out, "last_hidden_state", out
+                )
+
+            # Async evict the chunk we just finished back to CPU.
+            if nxt:  # only evict if there's more work (keep last chunk on GPU)
+                with torch.cuda.stream(self._copy_stream):
+                    move(current, "cpu")
+                # Need the next chunk resident: make main stream wait.
+                torch.cuda.current_stream(self.device).wait_stream(self._copy_stream)
+
+        hidden_states = inner_self.norm(hidden_states)
+        from transformers.modeling_outputs import BaseModelOutputWithPast  # noqa: PLC0415
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )

@@ -177,23 +177,22 @@ class ModelManager:
         if device == "mp" and torch.cuda.device_count() >= 2:
             if expert_offload and spec.moe:
                 # FP8 + device_map with CPU is rejected by transformers, so we
-                # load the whole model to CPU and let LayerStreamer page decoder
-                # layers GPU<->CPU with double buffering (async prefetch). This
-                # is what keeps BOTH GPUs busy: layers are assigned round-robin
-                # across cards and prefetched in parallel.
+                # load the whole model to CPU and stream decoder layers onto a
+                # single GPU a chunk at a time (double-buffered, like the user's
+                # iter_forward_gpu_buff). The shared rotary_emb + KV cache pin
+                # us to ONE gpu; both cards are exercised via parallel instances
+                # in the bench instead.
                 model = AutoModelForCausalLM.from_pretrained(
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                devices = list(range(torch.cuda.device_count()))
-                self._streamer = LayerStreamer.install(
-                    model, devices=devices, chunk=self._STREAM_CHUNK)
-                placement = {
-                    "mode": "layer_stream",
-                    "devices": devices,
-                    "chunk": self._STREAM_CHUNK,
-                    "n_layers": len(model.model.layers),
-                }
+                gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
+                self._streamer = LayerStreamer(
+                    model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
+                self._streamer.install()
+                placement = {"mode": "layer_stream", "gpu": gpu_id,
+                             "chunk": self._STREAM_CHUNK,
+                             "n_layers": len(model.model.layers)}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -218,9 +217,10 @@ class ModelManager:
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
-                self._streamer = LayerStreamer.install(
-                    model, devices=[gpu_id], chunk=self._STREAM_CHUNK)
-                placement = {"mode": "layer_stream", "devices": [gpu_id],
+                self._streamer = LayerStreamer(
+                    model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
+                self._streamer.install()
+                placement = {"mode": "layer_stream", "gpu": gpu_id,
                              "chunk": self._STREAM_CHUNK}
                 device = "mp_cpu_offload"
             else:
