@@ -43,7 +43,7 @@ class ExpertOffloader:
         # Capacity in MiB; defaults to leaving ~10 GiB free after the resident
         # non-expert weights. Override via DEMO_EXPERT_CACHE_GIB.
         import os  # noqa: PLC0415
-        self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "13.5"))
+        self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "11"))
         self._cache_used_bytes = 0
         self._cache_order: list[int] = []  # module ids in LRU order (front=LRU)
         self._on_gpu: set[int] = set()
