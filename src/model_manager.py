@@ -186,6 +186,13 @@ class ModelManager:
                     path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
+                # For inference we don't need the MoE load-balancing aux loss, and
+                # collecting router_logits through the streaming forward is fiddly
+                # (layers return a bare hidden Tensor when use_cache=False). Turn
+                # the flag off so Qwen3MoeForCausalLM.forward doesn't read
+                # outputs.router_logits.
+                if hasattr(model.config, "output_router_logits"):
+                    model.config.output_router_logits = False
                 gpu_id = int(__import__("os").environ.get("DEMO_GPU_ID", "0"))
                 self._streamer = LayerStreamer(
                     model.model, gpu=gpu_id, chunk=self._STREAM_CHUNK)
