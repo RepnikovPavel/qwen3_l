@@ -33,7 +33,9 @@ done
 
 echo "STATUS: Downloading model weights (~5.2GB)..."
 WEIGHT_FILE="model.safetensors"
-if ! wget --show-progress --continue "https://huggingface.co/$MODEL_ID/resolve/main/$WEIGHT_FILE"; then
+if ! wget --show-progress --continue \
+        --tries=0 --read-timeout=30 --waitretry=5 \
+        "https://huggingface.co/$MODEL_ID/resolve/main/$WEIGHT_FILE"; then
     echo "ERROR: Failed to download $WEIGHT_FILE"
     exit 1
 fi
