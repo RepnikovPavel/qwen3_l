@@ -287,8 +287,8 @@ def _bench_layer_forward(layer, model, cfg, args):
     cpu_dev = "cpu"
     hidden = cfg.hidden_size
     n_heads = cfg.num_attention_heads
-    n_kv = cfg.get("num_key_value_heads", n_heads)
-    head_dim = cfg.get("head_dim") or hidden // n_heads
+    n_kv = getattr(cfg, "num_key_value_heads", n_heads)
+    head_dim = getattr(cfg, "head_dim", None) or hidden // n_heads
 
     print("\n[LAYER FORWARD PASS]  (ms, single layer, batch=1)")
 
@@ -352,8 +352,8 @@ def _bench_context_transfer(model, cfg, args):
     """
     import torch  # noqa: PLC0415
     n_layers = cfg.num_hidden_layers
-    n_kv = cfg.get("num_key_value_heads", cfg.num_attention_heads)
-    head_dim = cfg.get("head_dim") or cfg.hidden_size // cfg.num_attention_heads
+    n_kv = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
     # KV cache shape: 2 (k,v) * n_layers * (batch, n_kv, ctx, head_dim) bf16.
     print("\n[CONTEXT (KV-cache) TRANSFER]  (ms)")
     print(f"  KV-cache shape: 2 * {n_layers} layers * "
