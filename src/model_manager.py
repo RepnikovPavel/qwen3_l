@@ -231,14 +231,23 @@ class ModelManager:
                 victims.append(lm.model)
             if model is not None:
                 victims.append(model)
-            # Fallback: find orphaned model objects still pinning CUDA memory.
+            # Fallback: find orphaned model objects still pinning memory.
+            # Cover both CUDA (VRAM) and CPU (RAM) — a failed device_map="cpu"
+            # load leaves ~30 GB of CPU tensors unreferenced from our code but
+            # alive in transformers' internal cache. Walk gc for nn.Module
+            # instances that look like a transformer and detach+del them.
             try:
-                import transformers  # noqa: PLC0415
+                import torch.nn as _nn  # noqa: PLC0415
+                seen = set()
                 for obj in _gc.get_objects():
-                    if isinstance(obj, transformers.PreTrainedModel):
+                    if id(obj) in seen:
+                        continue
+                    if isinstance(obj, _nn.Module):
                         try:
-                            if any(p.is_cuda for p in obj.parameters()):
+                            n_params = sum(1 for _ in obj.parameters())
+                            if n_params > 100:  # a real model, not a tiny layer
                                 victims.append(obj)
+                                seen.add(id(obj))
                         except Exception:
                             pass
             except Exception:
