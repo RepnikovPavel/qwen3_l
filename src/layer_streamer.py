@@ -64,25 +64,37 @@ class LayerStreamer:
     def install(cls, model, devices: list[int] | None = None, chunk: int = 2) -> "LayerStreamer":
         """Find the decoder layers under model.model.layers and hook them.
 
-        embed_tokens / lm_head / final norm are kept permanently on GPU 0 / the
-        last GPU respectively (they're small and used every step).
+        embed_tokens / lm_head / final norm are kept permanently resident on a
+        single GPU (the entry/exit GPU = devices[0]); decoder layers stream
+        GPU<->CPU. Multi-GPU round-robin across layers is *not* used because the
+        shared rotary_emb and KV cache break when layers hop between cards
+        (q*cos device mismatch). To use BOTH cards, run two model instances in
+        parallel (see bench/bench.py) rather than splitting one model.
+
+        So `devices` here is effectively [single_gpu]; extra entries ignored.
         """
         import torch  # noqa: PLC0415
 
         n = torch.cuda.device_count()
         devices = devices or list(range(max(1, n)))
+        # Pin to a single GPU to avoid cross-device KV/rotary issues.
+        single = [devices[0]]
         layers = list(model.model.layers)
-        streamer = cls(layers, devices, chunk)
+        streamer = cls(layers, single, chunk)
 
-        # Keep entry/exit small modules resident on the GPUs (not paged).
+        gpu = single[0]
+        target = f"cuda:{gpu}"
+        # Resident small modules on the entry/exit GPU.
         if hasattr(model.model, "embed_tokens") and model.model.embed_tokens is not None:
-            model.model.embed_tokens.to(f"cuda:{devices[0]}")
-        last_gpu = devices[-1]
+            model.model.embed_tokens.to(target)
+        # rotary_emb is shared across all layers — must live where layers run.
+        if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
+            model.model.rotary_emb.to(target)
         if hasattr(model.model, "norm") and model.model.norm is not None:
-            model.model.norm.to(f"cuda:{last_gpu}")
+            model.model.norm.to(target)
         if hasattr(model, "lm_head") and model.lm_head is not None:
             try:
-                model.lm_head.to(f"cuda:{last_gpu}")
+                model.lm_head.to(target)
             except Exception:
                 pass
 
@@ -94,13 +106,11 @@ class LayerStreamer:
                 with_kwargs=True,
             )
             streamer._hooks.append(hook)
-        # Install post-hook on the LAST layer to kick off wrap-around prefetch
-        # of layer 0 for the next token step (decode loop).
         streamer._installed = True
         # Prime the first chunk so the very first layer is already on GPU.
         streamer._prime()
-        print(f"[streamer] installed on {len(layers)} layers, devices={devices}, "
-              f"chunk={chunk}, home_gpu[0..]={streamer.home_gpu[:6]}...", flush=True)
+        print(f"[streamer] installed on {len(layers)} layers, gpu={gpu}, "
+              f"chunk={chunk} (single-GPU streaming; use bench for 2 GPUs)", flush=True)
         return streamer
 
     def remove(self):
