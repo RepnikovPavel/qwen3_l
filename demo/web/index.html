@@ -135,7 +135,11 @@
       <div class="ctx-row"><span>KV-память</span><span><b id="kv-used">0 B</b> / <span id="kv-max">0 B</span></span></div>
     </div>
     <div class="vram-panel">
-      <div class="ctx-row"><span>Видеокарты (VRAM)</span><span id="vram-status">—</span></div>
+      <div class="ctx-row">
+        <span>Видеокарты (VRAM) + RAM процесса</span>
+        <span><b id="mem-total">—</b> <button id="btn-mem-refresh" style="font-size:10px;padding:1px 6px;cursor:pointer;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:4px">↻</button></span>
+      </div>
+      <div class="ctx-row"><span>VRAM суммарно: <b id="mem-vram">—</b> · RSS: <b id="mem-rss">—</b></span><span id="mem-model">—</span></div>
       <div id="vram-gpus"></div>
     </div>
   </section>
@@ -165,7 +169,9 @@ async function boot(){
   }catch(e){showError('models: '+e);}
   await refreshSessions();
   refreshStatus();
+  refreshMemory();
   setInterval(refreshStatus,4000);
+  setInterval(refreshMemory,5000);
   // Restore last session from localStorage.
   const last=localStorage.getItem(LS_KEY);
   if(last && currentSession===null){ openSession(last); }
@@ -198,6 +204,19 @@ function renderVram(gpus){
       <div class="bar vram"><div style="width:${pct.toFixed(1)}%"></div></div>`;
     box.appendChild(row);
   }
+}
+
+const fmtMiB=m=>m>=1024?(m/1024).toFixed(2)+' GiB':m.toFixed(0)+' MiB';
+async function refreshMemory(){
+  try{
+    const r=await fetch('/api/memory');const d=await r.json();
+    renderVram(d.vram||[]);
+    const ram=d.ram||{};
+    $('mem-vram').textContent=fmtMiB(ram.vram_used_mib||0)+' / '+fmtMiB(ram.vram_total_mib||0);
+    $('mem-rss').textContent=fmtMiB(ram.rss_mib||0);
+    $('mem-total').textContent='VRAM '+(ram.vram_used_mib?fmtMiB(ram.vram_used_mib):'—')+' + RSS '+(ram.rss_mib?fmtMiB(ram.rss_mib):'—');
+    $('mem-model').textContent=d.loaded?('модель: '+d.model_id):'модель не загружена';
+  }catch(e){}
 }
 
 async function refreshSessions(){
@@ -275,9 +294,21 @@ async function doLoad(){
   finally{setOverlay(false);}
 }
 async function doUnload(){
-  setOverlay(true,'выгрузка…');
-  try{await fetch('/api/unload',{method:'POST'});}catch(e){showError(e);}
-  finally{setOverlay(false);refreshStatus();}
+  setOverlay(true,'освобождение CPU+GPU памяти…');
+  try{
+    const before=await fetch('/api/memory').then(r=>r.json());
+    await fetch('/api/unload',{method:'POST'});
+    // Give the manager a moment to actually free + empty_cache.
+    await new Promise(r=>setTimeout(r,1500));
+    const after=await fetch('/api/memory').then(r=>r.json());
+    const fb=before.ram||{}, fa=after.ram||{};
+    const freedVram=((fb.vram_used_mib||0)-(fa.vram_used_mib||0));
+    const freedRss=((fb.rss_mib||0)-(fa.rss_mib||0));
+    const msg=`Освобождено: VRAM ${fmtMiB(Math.max(0,freedVram))}, RAM ${fmtMiB(Math.max(0,freedRss))}. Модель выгружена, сессии сохранены.`;
+    $('msgs').innerHTML='';$('thinking').innerHTML='<span class="thinking-empty">модель выгружена (контекст сброшен, сессии в SQLite сохранены)</span>';
+    setOverlay(false);showError(msg);
+  }catch(e){setOverlay(false);showError(e);}
+  refreshStatus();refreshMemory();
 }
 async function doReset(){
   try{await fetch('/api/reset',{method:'POST'});$('msgs').innerHTML='';$('thinking').innerHTML='<span class="thinking-empty">контекст сброшен</span>';}catch(e){showError(e);}
@@ -348,6 +379,7 @@ async function send(){
 
 $('btn-load').onclick=doLoad;$('btn-unload').onclick=doUnload;$('btn-reset').onclick=doReset;
 $('btn-stop').onclick=doStop;$('btn-new-chat').onclick=newChat;
+$('btn-mem-refresh').onclick=refreshMemory;
 $('send').onclick=send;
 $('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
 $('input').addEventListener('input',e=>{e.target.style.height='auto';e.target.style.height=Math.min(120,e.target.scrollHeight)+'px';});
