@@ -1,26 +1,23 @@
 """
 Expert-level offload for Qwen3-MoE across the available GPUs.
 
-The model is 31 GB; one 16 GB GPU can't hold it, and loading it through a
-device_map that mixes in CPU triggers transformers' FP8 "weights conversion"
-validator (the checkpoint is ALREADY quantized — that path is wrong).
+The model is 31 GB. transformers REJECTS loading an FP8 checkpoint through a
+device_map that mixes GPU+CPU ("attempting to load an FP8 model with a
+device_map that contains a cpu/disk device — not supported when the model is
+quantized on the fly"). And it doesn't fit on a single 16 GB GPU either.
 
-Strategy (the "flat layout + expert load/unload" you asked for):
-  - Load via device_map="auto" across the GPUs ONLY (no CPU entry) → transformers
-    accepts it without conversion and splits the layers flat across cards
-    (layers 0..N/2 on gpu0, rest on gpu1). 31 GB / 2 ≈ 15.5 GB each — fits.
-  - After load, walk every MoE layer and move ONLY its `mlp.experts` weight
-    tensors (gate_up_proj, down_proj — 27 GB total) to CPU. The rest
-    (attention, router, shared expert, layernorms, embeddings — ~2 GB per GPU)
-    stays resident.
-  - Install forward pre/post hooks on each `mlp.experts` module that page its
-    stacked tensors onto the experts' home GPU right before they run, and back
-    to CPU after. Only the active layer's experts (~576 MiB) are on a GPU at
-    any moment, so VRAM stays ~1 GB resident + one expert slab.
+So we load to CPU only (device_map="cpu" — no validator trigger, no conversion),
+then MANUALLY place modules:
+  - routed experts (the big stacked tensors, 27 GB)  -> stay on CPU, paged per call
+  - everything else (attention, router, shared expert, embed, norm, lm_head)
+    -> split flat across the GPUs (~1 GB per card)
 
-We use module hooks (not a forward override) so the stock generate() works
-unchanged — the experts module is called normally by the MoE block; our hook
-just relocates its parameters in time.
+This is the "flat layout + expert load/unload" you asked for, and it sidesteps
+both the conversion error and the OOM. Per-GPU resident footprint is tiny;
+only the active layer's experts (~576 MiB) are on a GPU at any moment.
+
+Hooks (not a forward override) page each experts module's tensors GPU<-CPU
+right before it runs and back after — so the stock generate() works unchanged.
 """
 from __future__ import annotations
 
@@ -29,19 +26,27 @@ import torch.nn as nn
 
 
 class ExpertOffloader:
-    """Keeps routed-expert weight tensors on CPU, pages them per forward."""
+    """Keeps routed-expert weight tensors on CPU, pages them per forward.
+
+    Call ``place_model`` on a CPU-loaded model to distribute the non-expert
+    modules across GPUs, then the experts auto-page via forward hooks.
+    """
 
     def __init__(self, model: nn.Module):
         self.model = model
         self._handles: list = []
         self._installed = False
-        # Per-expert-module home GPU (discovered from where the module lives).
         self._home_gpu: dict[int, int] = {}
 
     @classmethod
     def install(cls, model: nn.Module) -> "ExpertOffloader":
+        """Place non-expert modules across GPUs + install paging hooks.
+
+        Assumes ``model`` was loaded with device_map="cpu" (so nothing is on a
+        GPU yet). After this returns: experts on CPU, rest split across GPUs.
+        """
         od = cls(model)
-        od._install()
+        od._place_and_hook()
         return od
 
     def remove(self):
@@ -49,7 +54,8 @@ class ExpertOffloader:
             h.remove()
         self._handles.clear()
         self._installed = False
-        # Restore each experts module to its home GPU.
+        # Restore experts to the home GPU so a later model.to('cpu') in unload
+        # can move them cleanly.
         for idx, experts in enumerate(self._iter_expert_modules()):
             gpu = self._home_gpu.get(idx)
             if gpu is not None:
@@ -64,52 +70,76 @@ class ExpertOffloader:
         for layer in getattr(inner, "layers", []):
             mlp = getattr(layer, "mlp", None)
             experts = getattr(mlp, "experts", None) if mlp is not None else None
-            # Qwen3MoeExperts has the stacked gate_up_proj / down_proj params.
             if experts is not None and hasattr(experts, "gate_up_proj"):
                 yield experts
 
-    def _install(self):
+    def _place_and_hook(self):
         if self._installed:
             return
-        n = 0
-        total_bytes = 0
-        for idx, experts in enumerate(self._iter_expert_modules()):
-            # Discover this module's home GPU from any of its params.
-            try:
-                sample = next(experts.parameters())
-                home_gpu = sample.device.index if sample.device.type == "cuda" else 0
-            except StopIteration:
-                home_gpu = 0
-            self._home_gpu[idx] = home_gpu
-            home = f"cuda:{home_gpu}"
+        import os  # noqa: PLC0415
 
-            # Move expert params to CPU now (resident state = offloaded).
-            for p in experts.parameters():
-                total_bytes += p.numel() * p.element_size()
-                p.data = p.data.to("cpu", non_blocking=False)
-            # Pre-hook: copy expert params onto their home GPU before the module runs.
-            pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
-            # Post-hook: copy them back to CPU after (frees VRAM).
-            post = experts.register_forward_hook(self._make_post_hook())
-            self._handles.append(pre)
-            self._handles.append(post)
-            n += 1
-        if torch.cuda.is_available():
-            for g in range(torch.cuda.device_count()):
-                torch.cuda.synchronize(f"cuda:{g}")
+        n_gpus = torch.cuda.device_count() or 1
+        # Decide a home GPU for each layer: round-robin across GPUs.
+        # The non-expert parts (attn/router/shared/norm) of that layer move
+        # there; the routed experts stay on CPU and page to the home GPU.
+        inner = getattr(self.model, "model", self.model)
+        layers = list(getattr(inner, "layers", []))
+        n_layers = len(layers)
+
+        # Entry modules (embed_tokens) on GPU 0.
+        if hasattr(inner, "embed_tokens") and inner.embed_tokens is not None:
+            inner.embed_tokens.to("cuda:0")
+        # rotary_emb shared across layers — keep on GPU 0 (layers are called in
+        # order; the activation hops to each layer's home GPU via the hook).
+        if hasattr(inner, "rotary_emb") and inner.rotary_emb is not None:
+            inner.rotary_emb.to("cuda:0")
+        # Exit modules (final norm, lm_head) on the last GPU.
+        last_gpu = n_gpus - 1
+        if hasattr(inner, "norm") and inner.norm is not None:
+            inner.norm.to(f"cuda:{last_gpu}")
+        if hasattr(self.model, "lm_head") and self.model.lm_head is not None:
+            try:
+                self.model.lm_head.to(f"cuda:{last_gpu}")
+            except Exception:
+                pass
+
+        total_offloaded = 0
+        for idx, layer in enumerate(layers):
+            gpu = idx % n_gpus
+            home = f"cuda:{gpu}"
+            self._home_gpu[idx] = gpu
+            # Move everything in this layer to the home GPU first...
+            layer.to(home)
+            # ...then push the routed-expert tensors back to CPU.
+            mlp = getattr(layer, "mlp", None)
+            experts = getattr(mlp, "experts", None) if mlp is not None else None
+            if experts is not None and hasattr(experts, "gate_up_proj"):
+                for p in experts.parameters():
+                    total_offloaded += p.numel() * p.element_size()
+                    p.data = p.data.to("cpu", non_blocking=False)
+                # Install paging hooks on this experts module.
+                pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
+                post = experts.register_forward_hook(self._make_post_hook())
+                self._handles.append(pre)
+                self._handles.append(post)
+            # Install a pre-hook on the whole layer to bridge activations onto
+            # its home GPU (needed because the previous layer may be on a
+            # different GPU in the round-robin).
+            layer.register_forward_pre_hook(self._make_layer_bridge(home))
+
+        for g in range(n_gpus):
+            torch.cuda.synchronize(f"cuda:{g}")
         self._installed = True
-        print(f"[expert-offload] {n} expert modules moved to CPU "
-              f"({total_bytes/1024**3:.2f} GiB); resident per-GPU = rest of model",
+        print(f"[expert-offload] placed {n_layers} layers across {n_gpus} GPU(s); "
+              f"{total_offloaded/1024**3:.2f} GiB of routed experts on CPU",
               flush=True)
 
     def _make_pre_hook(self, home: str):
-        """Build a closure that pages the expert tensors onto their home GPU."""
+        """Page the expert tensors onto their home GPU before the module runs."""
         def hook(_module, args):
             for p in _module.parameters():
                 if p.device.type == "cpu":
                     p.data = p.data.to(home, non_blocking=False)
-            # The activation tensor is produced by the MoE block (on the home GPU
-            # already since router/shared live there), but be defensive.
             new_args = []
             for a in args:
                 if isinstance(a, torch.Tensor) and str(a.device) != home:
@@ -120,7 +150,7 @@ class ExpertOffloader:
         return hook
 
     def _make_post_hook(self):
-        """Build a closure that pages expert tensors back to CPU after use."""
+        """Page expert tensors back to CPU after use."""
         def hook(_module, _args, output):
             for p in _module.parameters():
                 if p.device.type == "cuda":
@@ -128,4 +158,22 @@ class ExpertOffloader:
             return output
 
         return hook
+
+    def _make_layer_bridge(self, home: str):
+        """Layer pre-hook: move incoming activations onto this layer's home GPU.
+
+        With round-robin placement, the previous layer may live on a different
+        GPU, so hidden_states arrive on the wrong device. This bridges them.
+        """
+        def hook(_layer, args):
+            new_args = []
+            for a in args:
+                if isinstance(a, torch.Tensor) and a.device.type == "cuda" \
+                        and str(a.device) != home:
+                    a = a.to(home, non_blocking=True)
+                new_args.append(a)
+            return tuple(new_args)
+
+        return hook
+
 

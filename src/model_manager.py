@@ -198,27 +198,21 @@ class ModelManager:
 
         if device == "mp" and torch.cuda.device_count() >= 2:
             if expert_offload and spec.moe:
-                # MoE (30B): the FP8 checkpoint is ALREADY quantized, so we must
-                # NOT load it through device_map with a CPU entry (that triggers
-                # transformers' "weights conversion" validator and fails). Load
-                # via device_map="auto" across the GPUs ONLY (no CPU) — the
-                # layers split flat across cards. Give a per-GPU memory cap
-                # (13 GiB) so the balancer leaves headroom for overhead+KV,
-                # otherwise 31 GB onto 2x16 GB is too tight and OOMs at load.
-                # ExpertOffloader then moves the 27 GB routed-expert tensors to
-                # CPU and pages them per forward.
+                # MoE (30B): transformers REJECTS loading an FP8 checkpoint
+                # through a device_map that mixes GPU+CPU ("weights conversion"
+                # validator — the checkpoint is ALREADY quantized, that path is
+                # wrong), and it doesn't fit on one 16 GB GPU. So load to CPU
+                # only (no validator trigger), then ExpertOffloader manually
+                # places the non-expert modules across the GPUs and keeps the
+                # 27 GB routed-expert tensors on CPU, paging them per forward.
                 from src.expert_streamer import ExpertOffloader  # noqa: PLC0415
-                cap_gib = int(__import__("os").environ.get("DEMO_MOE_GPU_GIB", "15"))
-                max_memory = {i: f"{cap_gib}GiB" for i in range(torch.cuda.device_count())}
                 model = AutoModelForCausalLM.from_pretrained(
-                    path, torch_dtype="auto", device_map="auto",
-                    max_memory=max_memory,
+                    path, torch_dtype="auto", device_map="cpu",
                     local_files_only=True, attn_implementation=attn,
                 ).eval()
                 self._offloader = ExpertOffloader.install(model)
-                placement = {"mode": "expert_offload", "cap_gib": cap_gib,
-                             "n_layers": len(model.model.layers),
-                             "hfm": len(getattr(model, "hf_device_map", {}))}
+                placement = {"mode": "expert_offload",
+                             "n_layers": len(model.model.layers)}
                 device = "mp_cpu_offload"
             else:
                 model = AutoModelForCausalLM.from_pretrained(
