@@ -177,8 +177,9 @@ class LayerStreamer:
             move(current, self.device)
 
             # Compute the current chunk. Ask MoE layers to return router_logits
-            # (output_router_logits=True) so Qwen3MoeForCausalLM.forward finds
-            # them in the aggregated model output.
+            # (output_router_logits) so Qwen3MoeForCausalLM.forward finds them
+            # in the aggregated model output. generate() passes this kwarg
+            # through kwargs already, so don't set it explicitly (would clash).
             for layer in current:
                 out = layer(
                     hidden_states,
@@ -188,7 +189,6 @@ class LayerStreamer:
                     position_embeddings=position_embeddings,
                     use_cache=use_cache,
                     cache_position=cache_position,
-                    output_router_logits=True,
                     **kwargs,
                 )
                 # Layers return a tuple (hidden_states, attn_or_router...) or a
