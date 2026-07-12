@@ -12,14 +12,18 @@ then MANUALLY place modules:
   - everything else (attention, router, shared expert, embed, norm, lm_head)
     -> split flat across the GPUs (~1 GB per card)
 
-This is the "flat layout + expert load/unload" you asked for, and it sidesteps
-both the conversion error and the OOM. Per-GPU resident footprint is tiny;
-only the active layer's experts (~576 MiB) are on a GPU at any moment.
+With 2 GPUs we use contiguous-half placement (layers 0..N/2 on cuda:0,
+N/2..N on cuda:1) and bridge activations + rotary cos/sin via layer pre-hooks
+(with_kwargs=True). Each GPU gets its own LRU expert cache (DEMO_EXPERT_CACHE_GIB
+per card, default 11 GiB).
 
 Hooks (not a forward override) page each experts module's tensors GPU<-CPU
-right before it runs and back after — so the stock generate() works unchanged.
+right before it runs — stock generate() works unchanged.
 """
 from __future__ import annotations
+
+import os
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -36,28 +40,20 @@ class ExpertOffloader:
         self.model = model
         self._handles: list = []
         self._installed = False
-        self._home_gpu: dict[int, int] = {}
-        # ---- LRU cache of resident experts on the GPU ----
-        # Don't evict immediately — keep recently-used expert modules on the GPU
-        # so repeated decode steps (which hit the same experts) don't re-copy.
-        # Capacity in MiB; defaults to leaving ~10 GiB free after the resident
-        # non-expert weights. Override via DEMO_EXPERT_CACHE_GIB.
-        import os  # noqa: PLC0415
+        self._home_gpu: dict[int, int] = {}  # layer idx -> gpu id
+        # Per-GPU LRU cache state
         self._cache_gib = float(os.environ.get("DEMO_EXPERT_CACHE_GIB", "11"))
-        self._cache_used_bytes = 0
-        self._cache_order: list[int] = []  # module ids in LRU order (front=LRU)
-        self._on_gpu: set[int] = set()
-        self._module_size: dict[int, int] = {}  # module id -> bytes of experts
-        # Direct id -> module object map (avoids linear scan during eviction).
+        self._cache_used_bytes: dict[int, int] = {}   # gpu -> bytes
+        self._cache_order: dict[int, list[int]] = {}  # gpu -> module ids LRU
+        self._on_gpu: dict[int, set[int]] = {}        # gpu -> module ids resident
+        self._module_size: dict[int, int] = {}        # module id -> bytes
         self._module_by_id: dict[int, nn.Module] = {}
+        self._module_home_gpu: dict[int, int] = {}    # module id -> home gpu
+        self._split_gpus = False
 
     @classmethod
     def install(cls, model: nn.Module) -> "ExpertOffloader":
-        """Place non-expert modules across GPUs + install paging hooks.
-
-        Assumes ``model`` was loaded with device_map="cpu" (so nothing is on a
-        GPU yet). After this returns: experts on CPU, rest split across GPUs.
-        """
+        """Place non-expert modules across GPUs + install paging hooks."""
         od = cls(model)
         od._place_and_hook()
         return od
@@ -67,8 +63,6 @@ class ExpertOffloader:
             h.remove()
         self._handles.clear()
         self._installed = False
-        # Restore experts to the home GPU so a later model.to('cpu') in unload
-        # can move them cleanly.
         for idx, experts in enumerate(self._iter_expert_modules()):
             gpu = self._home_gpu.get(idx)
             if gpu is not None:
@@ -86,54 +80,65 @@ class ExpertOffloader:
             if experts is not None and hasattr(experts, "gate_up_proj"):
                 yield experts
 
+    def _init_gpu_cache(self, gpu: int):
+        if gpu not in self._cache_order:
+            self._cache_order[gpu] = []
+            self._on_gpu[gpu] = set()
+            self._cache_used_bytes[gpu] = 0
+
     def _place_and_hook(self):
         if self._installed:
             return
-        import os  # noqa: PLC0415
 
         n_gpus = torch.cuda.device_count() or 1
-        # All decoder layers run on a SINGLE gpu (gpu0). Splitting across GPUs
-        # breaks the shared rotary_emb (cos/sin unpacked inside attention.forward,
-        # invisible to a layer pre-hook). We compensate with TWO optimizations:
-        #   1) LRU cache — recently-used experts stay on the GPU (post-hook does
-        #      NOT evict). With ~12 GiB cache ~21 of 48 expert modules stay
-        #      resident after warmup, so most decode steps are cache hits.
-        #   2) Async prefetch — post-hook kicks off a CUDA-stream copy of the
-        #      NEXT layer's experts so the transfer overlaps with this layer's
-        #      compute. Hides the residual ~half-miss cost.
+        split = (n_gpus >= 2
+                 and os.environ.get("DEMO_EXPERT_SPLIT_GPU", "1") != "0")
+        self._split_gpus = split
+
         inner = getattr(self.model, "model", self.model)
         layers = list(getattr(inner, "layers", []))
         n_layers = len(layers)
-        home = "cuda:0"
-        home_gpu = 0
-        # Map each expert-module-id -> its index in the layer order, so the
-        # post-hook can prefetch the NEXT layer's experts.
-        self._expert_ids_in_order: list[int] = []
-        self._prefetch_stream = torch.cuda.Stream(device=home)
+        half = n_layers // 2
 
-        # Entry modules (embed_tokens) on the home GPU.
+        if split:
+            embed_home = "cuda:0"
+            exit_home = f"cuda:{n_gpus - 1}"  # norm/lm_head follow last layers
+        else:
+            embed_home = exit_home = "cuda:0"
+
         if hasattr(inner, "embed_tokens") and inner.embed_tokens is not None:
-            inner.embed_tokens.to(home)
-        # rotary_emb shared across layers — on the home GPU (same as layers).
+            inner.embed_tokens.to(embed_home)
         if hasattr(inner, "rotary_emb") and inner.rotary_emb is not None:
-            inner.rotary_emb.to(home)
-        # Exit modules (final norm, lm_head) on the home GPU too.
+            inner.rotary_emb.to(embed_home)
         if hasattr(inner, "norm") and inner.norm is not None:
-            inner.norm.to(home)
+            inner.norm.to(exit_home)
         if hasattr(self.model, "lm_head") and self.model.lm_head is not None:
             try:
-                self.model.lm_head.to(home)
+                self.model.lm_head.to(exit_home)
             except Exception:
                 pass
 
         total_offloaded = 0
+        placement_counts: dict[int, int] = {}
+
         for idx, layer in enumerate(layers):
+            if split:
+                home_gpu = 0 if idx < half else (n_gpus - 1)
+            else:
+                home_gpu = 0
+            home = f"cuda:{home_gpu}"
             self._home_gpu[idx] = home_gpu
-            # Move everything in this layer to the home GPU first...
+            self._init_gpu_cache(home_gpu)
+            placement_counts[home_gpu] = placement_counts.get(home_gpu, 0) + 1
+
             layer.to(home)
-            # ...then push the routed-expert tensors back to CPU (PINNED, so the
-            # later CPU->GPU copies use DMA instead of staging through pageable
-            # memory — ~2-3x faster).
+
+            if split:
+                bridge = layer.register_forward_pre_hook(
+                    self._make_layer_bridge(home), with_kwargs=True,
+                )
+                self._handles.append(bridge)
+
             mlp = getattr(layer, "mlp", None)
             experts = getattr(mlp, "experts", None) if mlp is not None else None
             if experts is not None and hasattr(experts, "gate_up_proj"):
@@ -141,7 +146,6 @@ class ExpertOffloader:
                 for p in experts.parameters():
                     total_offloaded += p.numel() * p.element_size()
                     mod_bytes += p.numel() * p.element_size()
-                    # Move to CPU then wrap in pinned storage for fast DMA.
                     p.data = p.data.to("cpu", non_blocking=False)
                     try:
                         p.data = torch.empty(
@@ -149,55 +153,55 @@ class ExpertOffloader:
                             device="cpu", pin_memory=True,
                         ).copy_(p.data)
                     except RuntimeError:
-                        pass  # host OOM on pin — fall back to pageable
-                self._module_size[id(experts)] = mod_bytes
-                self._module_by_id[id(experts)] = experts
-                self._expert_ids_in_order.append(id(experts))
-                # Install paging hooks on this experts module.
-                pre = experts.register_forward_pre_hook(self._make_pre_hook(home))
+                        pass
+                mod_id = id(experts)
+                self._module_size[mod_id] = mod_bytes
+                self._module_by_id[mod_id] = experts
+                self._module_home_gpu[mod_id] = home_gpu
+
+                pre = experts.register_forward_pre_hook(
+                    self._make_pre_hook(home, home_gpu),
+                )
                 post = experts.register_forward_hook(self._make_post_hook())
                 self._handles.append(pre)
                 self._handles.append(post)
-            # No cross-GPU bridge needed — all layers share one GPU.
 
-        torch.cuda.synchronize(home)
+        for gpu in placement_counts:
+            torch.cuda.synchronize(gpu)
+
         self._installed = True
         cap_mib = self._cache_gib * 1024
-        n_fit = int(cap_mib // (min(self._module_size.values()) / 1024**2)) if self._module_size else 0
-        print(f"[expert-offload] placed {n_layers} layers on {home}; "
-              f"{total_offloaded/1024**3:.2f} GiB of routed experts on CPU "
-              f"(pinned, DMA copy). GPU cache: {cap_mib:.0f} MiB "
-              f"(~{n_fit} expert modules stay resident after warmup)", flush=True)
+        min_mod = min(self._module_size.values()) if self._module_size else 1
+        n_fit = int(cap_mib // (min_mod / 1024**2))
+        mode = (f"split {placement_counts}" if split
+                else "single cuda:0")
+        print(f"[expert-offload] {n_layers} layers, mode={mode}; "
+              f"{total_offloaded/1024**3:.2f} GiB routed experts on CPU "
+              f"(pinned DMA). Per-GPU cache: {cap_mib:.0f} MiB "
+              f"(~{n_fit} modules/GPU after warmup)", flush=True)
 
-    def _touch(self, mod_id: int):
-        """Mark a module as most-recently-used in the LRU order."""
-        if mod_id in self._cache_order:
-            self._cache_order.remove(mod_id)
-        self._cache_order.append(mod_id)
+    def _touch(self, mod_id: int, gpu: int):
+        order = self._cache_order[gpu]
+        if mod_id in order:
+            order.remove(mod_id)
+        order.append(mod_id)
 
-    def _free_vram_bytes(self) -> float:
-        """Current free VRAM on the home GPU (dynamic, accounts for KV growth)."""
+    def _free_vram_bytes(self, gpu: int) -> float:
         try:
-            import torch  # noqa: PLC0415
-            free, _total = torch.cuda.mem_get_info(0)
+            free, _total = torch.cuda.mem_get_info(gpu)
             return free
         except Exception:
             return 0.0
 
-    def _evict_until_fits(self, need_bytes: int):
-        """Evict LRU expert modules until there is room for `need_bytes`.
-
-        Uses DYNAMIC free VRAM (mem_get_info) rather than a fixed cap, so the
-        cache auto-shrinks as the KV cache grows during long generations —
-        avoids OOM. Keeps a safety margin (default 1 GiB) below the hard limit.
-        """
-        safety_gib = 1.0  # never fill the last 1 GiB (PyTorch allocator overhead)
+    def _evict_until_fits(self, need_bytes: int, gpu: int):
+        safety_gib = float(os.environ.get("DEMO_EXPERT_CACHE_SAFETY_GIB", "1.0"))
         hard_floor = safety_gib * 1024**3
-        while self._cache_order:
-            free = self._free_vram_bytes()
+        order = self._cache_order[gpu]
+        while order:
+            free = self._free_vram_bytes(gpu)
             if free - need_bytes > hard_floor:
-                return  # there's room
-            victim = self._cache_order.pop(0)  # LRU
+                return
+            victim = order.pop(0)
             experts = self._module_by_id.get(victim)
             if experts is None:
                 continue
@@ -210,34 +214,29 @@ class ExpertOffloader:
                     )
                     cpu.copy_(p.data)
                     p.data = cpu
-            self._cache_used_bytes -= sz
-            self._on_gpu.discard(victim)
+            self._cache_used_bytes[gpu] -= sz
+            self._on_gpu[gpu].discard(victim)
 
-    def _make_pre_hook(self, home: str):
-        """Page the expert tensors onto their home GPU before the module runs.
-
-        LRU-cached: if already resident (cache hit) just bump the order; else
-        evict LRU victims (dynamic — based on actual free VRAM) and copy this
-        module in (pinned DMA).
-        """
+    def _make_pre_hook(self, home: str, home_gpu: int):
         def hook(_module, args):
             mod_id = id(_module)
+            on_gpu = self._on_gpu[home_gpu]
             already_on_gpu = all(p.device.type == "cuda"
                                  for p in _module.parameters())
-            if mod_id in self._on_gpu or already_on_gpu:
-                if mod_id not in self._on_gpu:
-                    self._on_gpu.add(mod_id)
-                    self._cache_used_bytes += self._module_size.get(mod_id, 0)
-                self._touch(mod_id)
+            if mod_id in on_gpu or already_on_gpu:
+                if mod_id not in on_gpu:
+                    on_gpu.add(mod_id)
+                    self._cache_used_bytes[home_gpu] += self._module_size.get(mod_id, 0)
+                self._touch(mod_id, home_gpu)
             else:
                 sz = self._module_size.get(mod_id, 0)
-                self._evict_until_fits(sz)
+                self._evict_until_fits(sz, home_gpu)
                 for p in _module.parameters():
                     if p.device.type == "cpu":
                         p.data = p.data.to(home, non_blocking=False)
-                self._on_gpu.add(mod_id)
-                self._cache_used_bytes += sz
-                self._touch(mod_id)
+                on_gpu.add(mod_id)
+                self._cache_used_bytes[home_gpu] += sz
+                self._touch(mod_id, home_gpu)
             new_args = []
             for a in args:
                 if isinstance(a, torch.Tensor) and str(a.device) != home:
@@ -248,36 +247,25 @@ class ExpertOffloader:
         return hook
 
     def _make_post_hook(self):
-        """No eviction after use — keep experts resident in the LRU cache.
-
-        Eviction happens lazily in the pre-hook (dynamic, based on free VRAM)
-        when a new module needs room. This turns repeated decode steps into
-        cache hits (no copy at all) for experts that are already resident.
-        """
         def hook(_module, _args, output):
             return output
 
         return hook
 
     def _make_layer_bridge(self, home: str):
-        """Layer pre-hook: move incoming activations onto this layer's home GPU.
-
-        With contiguous-half placement, only the boundary layer (first of the
-        second half) actually hops GPUs; others are no-ops. We move args AND
-        kwargs (position_embeddings = rotary cos/sin lives in kwargs and is
-        shared, so it must hop with the activation).
-        """
+        """Move activations + rotary cos/sin onto this layer's home GPU."""
         def hook(_layer, args, kwargs):
             def _mv(x):
                 if isinstance(x, torch.Tensor) and x.device.type == "cuda" \
                         and str(x.device) != home:
                     return x.to(home, non_blocking=True)
+                if isinstance(x, (list, tuple)):
+                    return type(x)(_mv(v) for v in x)
                 return x
+
             new_args = tuple(_mv(a) for a in args)
             if kwargs:
                 kwargs = {k: _mv(v) for k, v in kwargs.items()}
             return new_args, kwargs
 
         return hook
-
-
