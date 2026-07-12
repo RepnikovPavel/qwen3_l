@@ -44,6 +44,9 @@ docker run --rm \
     --name "$CONTAINER_NAME" \
     --runtime=nvidia \
     --gpus all \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     --mount type=bind,src="$CKPTDIR",target="$CKPTDIR" \
