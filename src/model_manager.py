@@ -264,7 +264,17 @@ class ModelManager:
                 del lm
             for m in victims:
                 del m
-            _gc.collect()
+            # Drop the victims, then run multiple gc passes (cyclic refs to
+            # accelerate Hooks / DynamicCache may need >1 collection).
+            for _ in range(3):
+                _gc.collect()
+            # Tell glibc to return freed arenas to the OS (otherwise RSS stays
+            # high even after the Python objects are gone).
+            try:
+                import ctypes  # noqa: PLC0415
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
             try:
                 if _torch.cuda.is_available():
                     _torch.cuda.empty_cache()
