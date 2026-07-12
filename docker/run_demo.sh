@@ -32,6 +32,8 @@ fi
 echo "→ launching demo on 0.0.0.0:$PORT  (DEMO_DEVICE=${DEMO_DEVICE:-mp})"
 echo "→ access via: ssh -L ${PORT}:localhost:${PORT} tuna-server  →  http://localhost:${PORT}"
 
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
 docker run -d --rm \
     --name "$CONTAINER_NAME" \
     --runtime=nvidia \
