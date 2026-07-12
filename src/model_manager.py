@@ -54,6 +54,17 @@ class LoadedModel:
 class ModelManager:
     """Process-global owner of the currently loaded model."""
 
+    # MoE expert offload tuning (30B on 2x16 GB):
+    #   - per-GPU cap leaves room for activations + KV cache during generation
+    #   - large CPU budget accepts all the spilled expert weights (~25 GB)
+    # Override via env if you want to retune for different hardware.
+    _MOE_OFFLOAD_PER_GPU_GIB = int(
+        __import__("os").environ.get("DEMO_MOE_GPU_GIB", "6")
+    )
+    _MOE_OFFLOAD_CPU_GIB = int(
+        __import__("os").environ.get("DEMO_MOE_CPU_GIB", "64")
+    )
+
     def __init__(self, ckptdir: str):
         self.ckptdir = ckptdir
         self._loaded: Optional[LoadedModel] = None
@@ -168,14 +179,30 @@ class ModelManager:
         placement: dict = {}
 
         if device == "mp" and torch.cuda.device_count() >= 2:
-            model = AutoModelForCausalLM.from_pretrained(
-                path, torch_dtype="auto", device_map="auto",
-                local_files_only=True, attn_implementation=attn,
-            ).eval()
-            placement = dict(getattr(model, "hf_device_map", {}))
             if expert_offload and spec.moe:
-                placement = self._offload_experts_to_cpu(model, placement)
+                # MoE too big for 2x16 GB: load via device_map="auto" with a
+                # per-GPU cap plus a large CPU budget. accelerate places what
+                # fits on the GPUs and spills the rest (the expert weight
+                # tensors dominate) to CPU RAM, paging layers in/out as needed.
+                n_gpu = torch.cuda.device_count()
+                # Leave headroom on each GPU for activations + KV cache.
+                per_gpu_gib = self._MOE_OFFLOAD_PER_GPU_GIB
+                max_memory = {i: f"{per_gpu_gib}GiB" for i in range(n_gpu)}
+                max_memory["cpu"] = self._MOE_OFFLOAD_CPU_GIB * 1024  # MiB
+                print(f"[manager] MoE offload: max_memory={max_memory}", flush=True)
+                model = AutoModelForCausalLM.from_pretrained(
+                    path, torch_dtype="auto", device_map="auto",
+                    max_memory=max_memory, local_files_only=True,
+                    attn_implementation=attn,
+                ).eval()
+                placement = dict(getattr(model, "hf_device_map", {}))
                 device = "mp_cpu_offload"
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    path, torch_dtype="auto", device_map="auto",
+                    local_files_only=True, attn_implementation=attn,
+                ).eval()
+                placement = dict(getattr(model, "hf_device_map", {}))
         elif device == "cpu":
             model = AutoModelForCausalLM.from_pretrained(
                 path, torch_dtype="auto", device_map="cpu",

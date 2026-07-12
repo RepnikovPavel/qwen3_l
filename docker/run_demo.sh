@@ -42,6 +42,7 @@ docker run --rm \
     --ulimit stack=67108864 \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    -e PYTORCH_ALLOC_CONF=expandable_segments:True \
     -e CKPTDIR="$CKPTDIR" \
     -e DEMO_DEVICE="${DEMO_DEVICE:-mp}" \
     -e DEMO_GPU_ID="${DEMO_GPU_ID:-0}" \
