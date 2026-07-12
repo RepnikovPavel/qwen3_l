@@ -42,7 +42,8 @@ class ExpertOffloader:
         self._module_home_gpu: dict[int, int] = {}
         # Per-expert-slice LRU (default mode)
         self._slice_mode = os.environ.get("DEMO_EXPERT_SLICE_MODE", "1") != "0"
-        self._slice_cache: dict[int, dict[tuple, tuple]] = {}   # gpu -> key -> (g,d,sz)
+        # gpu -> key -> (gate_up, gu_scale, down, dn_scale, sz)
+        self._slice_cache: dict[int, dict[tuple, tuple]] = {}
         self._slice_order: dict[int, list[tuple]] = {}
         self._slice_used: dict[int, int] = {}
         self._split_gpus = False
@@ -148,6 +149,7 @@ class ExpertOffloader:
                 total_offloaded += p.numel() * p.element_size()
                 mod_bytes += p.numel() * p.element_size()
                 self._pin_cpu(p)
+            # FP8Experts also has scale_inv Parameters (included in parameters()).
 
             mod_id = id(experts)
             self._module_size[mod_id] = mod_bytes
@@ -160,6 +162,11 @@ class ExpertOffloader:
                 gu = experts.gate_up_proj.data[e0]
                 dn = experts.down_proj.data[e0]
                 slice_bytes = (gu.numel() + dn.numel()) * gu.element_size()
+                if hasattr(experts, "gate_up_proj_scale_inv"):
+                    slice_bytes += (
+                        experts.gate_up_proj_scale_inv.data[e0].numel()
+                        + experts.down_proj_scale_inv.data[e0].numel()
+                    ) * experts.gate_up_proj_scale_inv.data[e0].element_size()
 
             if self._slice_mode:
                 experts._qwen_offloader = self  # noqa: SLF001
@@ -218,28 +225,41 @@ class ExpertOffloader:
             victim = order.pop(0)
             entry = cache.pop(victim, None)
             if entry is not None:
-                self._slice_used[gpu] -= entry[2]
+                self._slice_used[gpu] -= entry[4]
 
     def get_expert_slices(self, experts: nn.Module, expert_idx: int, gpu: int):
-        """Return (gate_up, down_proj) weight matrices on cuda:gpu (LRU)."""
+        """Return FP8 weight rows (+ scale_inv) on cuda:gpu (LRU).
+
+        FP8Experts.forward uses ``self.linear(inp, weight, weight_scale_inv)``
+        for W8A8 block matmul — plain F.linear cannot mix bf16 activations
+        with float8 weights.
+        """
         key = (id(experts), expert_idx)
         cache = self._slice_cache[gpu]
         if key in cache:
-            gate_up, down, sz = cache[key]
+            gate_up, gu_scale, down, dn_scale, sz = cache[key]
             self._touch_slice(key, gpu)
-            return gate_up, down
+            return gate_up, gu_scale, down, dn_scale
 
         gu_cpu = experts.gate_up_proj.data[expert_idx]
         dn_cpu = experts.down_proj.data[expert_idx]
         sz = (gu_cpu.numel() + dn_cpu.numel()) * gu_cpu.element_size()
+        gu_scale_cpu = dn_scale_cpu = None
+        if hasattr(experts, "gate_up_proj_scale_inv"):
+            gu_scale_cpu = experts.gate_up_proj_scale_inv.data[expert_idx]
+            dn_scale_cpu = experts.down_proj_scale_inv.data[expert_idx]
+            sz += (gu_scale_cpu.numel() + dn_scale_cpu.numel()) * gu_scale_cpu.element_size()
+
         self._evict_slices_until_fits(sz, gpu)
         home = f"cuda:{gpu}"
         gate_up = gu_cpu.to(home, non_blocking=True)
         down = dn_cpu.to(home, non_blocking=True)
-        cache[key] = (gate_up, down, sz)
+        gu_scale = gu_scale_cpu.to(home, non_blocking=True) if gu_scale_cpu is not None else None
+        dn_scale = dn_scale_cpu.to(home, non_blocking=True) if dn_scale_cpu is not None else None
+        cache[key] = (gate_up, gu_scale, down, dn_scale, sz)
         self._slice_order[gpu].append(key)
         self._slice_used[gpu] += sz
-        return gate_up, down
+        return gate_up, gu_scale, down, dn_scale
 
     # ---- layer LRU (legacy) ------------------------------------------------
 
@@ -328,9 +348,10 @@ def _slice_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Qwen3MoeExperts.forward with per-expert slice LRU (weights stay on CPU)."""
+    """FP8Experts.forward with per-expert slice LRU (weights stay on CPU)."""
     offloader: ExpertOffloader = self._qwen_offloader  # noqa: SLF001
     gpu: int = self._qwen_home_gpu  # noqa: SLF001
+    linear_fn = getattr(self, "linear", None)
     final_hidden_states = torch.zeros_like(hidden_states)
     with torch.no_grad():
         expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
@@ -343,11 +364,21 @@ def _slice_experts_forward(
             continue
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
-        gate_up, down = offloader.get_expert_slices(self, expert_idx, gpu)
-        gate, up = F.linear(current_state, gate_up).chunk(2, dim=-1)
-        current_hidden = self.act_fn(gate) * up
-        current_hidden = F.linear(current_hidden, down)
-        current_hidden = current_hidden * top_k_weights[token_idx, top_k_pos, None]
+        gate_up, gu_scale, down, dn_scale = offloader.get_expert_slices(
+            self, expert_idx, gpu,
+        )
+        if linear_fn is not None and gu_scale is not None:
+            gate, up = linear_fn(
+                current_state, gate_up, gu_scale,
+            ).chunk(2, dim=-1)
+            current_hidden = self.act_fn(gate) * up
+            current_hidden = linear_fn(current_hidden, down, dn_scale)
+        else:
+            gate, up = F.linear(current_state, gate_up).chunk(2, dim=-1)
+            current_hidden = self.act_fn(gate) * up
+            current_hidden = F.linear(current_hidden, down)
+        routing = top_k_weights[token_idx, top_k_pos, None]
+        current_hidden = current_hidden * routing.to(current_hidden.dtype)
         final_hidden_states.index_add_(
             0, token_idx, current_hidden.to(final_hidden_states.dtype),
         )
