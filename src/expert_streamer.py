@@ -175,10 +175,28 @@ class ExpertOffloader:
             self._cache_order.remove(mod_id)
         self._cache_order.append(mod_id)
 
+    def _free_vram_bytes(self) -> float:
+        """Current free VRAM on the home GPU (dynamic, accounts for KV growth)."""
+        try:
+            import torch  # noqa: PLC0415
+            free, _total = torch.cuda.mem_get_info(0)
+            return free
+        except Exception:
+            return 0.0
+
     def _evict_until_fits(self, need_bytes: int):
-        """Evict least-recently-used expert modules until `need_bytes` free."""
-        cap = self._cache_gib * 1024**3
-        while self._cache_used_bytes + need_bytes > cap and self._cache_order:
+        """Evict LRU expert modules until there is room for `need_bytes`.
+
+        Uses DYNAMIC free VRAM (mem_get_info) rather than a fixed cap, so the
+        cache auto-shrinks as the KV cache grows during long generations —
+        avoids OOM. Keeps a safety margin (default 1 GiB) below the hard limit.
+        """
+        safety_gib = 1.0  # never fill the last 1 GiB (PyTorch allocator overhead)
+        hard_floor = safety_gib * 1024**3
+        while self._cache_order:
+            free = self._free_vram_bytes()
+            if free - need_bytes > hard_floor:
+                return  # there's room
             victim = self._cache_order.pop(0)  # LRU
             experts = self._module_by_id.get(victim)
             if experts is None:
@@ -186,7 +204,6 @@ class ExpertOffloader:
             sz = self._module_size.get(victim, 0)
             for p in experts.parameters():
                 if p.device.type == "cuda":
-                    # Copy back to pinned CPU and free the GPU copy.
                     cpu = torch.empty(
                         p.data.shape, dtype=p.data.dtype,
                         device="cpu", pin_memory=True,
@@ -200,20 +217,15 @@ class ExpertOffloader:
         """Page the expert tensors onto their home GPU before the module runs.
 
         LRU-cached: if already resident (cache hit) just bump the order; else
-        evict LRU victims to make room and copy this module in (pinned DMA).
-        If the post-hook of the previous layer already prefetched us on the
-        side stream, just wait on that stream (no extra copy).
+        evict LRU victims (dynamic — based on actual free VRAM) and copy this
+        module in (pinned DMA).
         """
         def hook(_module, args):
             mod_id = id(_module)
-            # Wait for any in-flight prefetch of this module.
-            torch.cuda.current_stream(home).wait_stream(self._prefetch_stream)
             already_on_gpu = all(p.device.type == "cuda"
                                  for p in _module.parameters())
             if mod_id in self._on_gpu or already_on_gpu:
-                # Cache hit (genuine or prefetched) — no copy, just touch.
                 if mod_id not in self._on_gpu:
-                    # Was prefetched but not yet recorded — record now.
                     self._on_gpu.add(mod_id)
                     self._cache_used_bytes += self._module_size.get(mod_id, 0)
                 self._touch(mod_id)
@@ -236,34 +248,13 @@ class ExpertOffloader:
         return hook
 
     def _make_post_hook(self):
-        """No immediate eviction — keep experts resident (LRU).
+        """No eviction after use — keep experts resident in the LRU cache.
 
-        Also kick off an async prefetch of the NEXT layer's experts on a side
-        CUDA stream, so the CPU->GPU copy overlaps with the current layer's
-        compute. The next pre-hook waits on the stream only if the module
-        wasn't already resident.
+        Eviction happens lazily in the pre-hook (dynamic, based on free VRAM)
+        when a new module needs room. This turns repeated decode steps into
+        cache hits (no copy at all) for experts that are already resident.
         """
         def hook(_module, _args, output):
-            mod_id = id(_module)
-            # Find this module's position and prefetch the next one.
-            try:
-                idx = self._expert_ids_in_order.index(mod_id)
-            except ValueError:
-                idx = -1
-            if idx >= 0 and idx + 1 < len(self._expert_ids_in_order):
-                next_id = self._expert_ids_in_order[idx + 1]
-                if next_id not in self._on_gpu:
-                    experts = self._module_by_id.get(next_id)
-                    if experts is not None:
-                        sz = self._module_size.get(next_id, 0)
-                        # Only prefetch if there's room (don't evict for it).
-                        cap = self._cache_gib * 1024**3
-                        if self._cache_used_bytes + sz <= cap:
-                            with torch.cuda.stream(self._prefetch_stream):
-                                for p in experts.parameters():
-                                    if p.device.type == "cpu":
-                                        p.data = p.data.to("cuda:0",
-                                            non_blocking=True)
             return output
 
         return hook
