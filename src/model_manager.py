@@ -294,19 +294,25 @@ class ModelManager:
         n_layers = len(layers)
         split = n_layers // n_gpus  # first half -> gpu0, rest -> gpu1
 
-        # Embeddings / lm_head / final norm on GPU 0 (entry point).
+        # Embeddings on GPU 0 (entry point); lm_head + final norm on the LAST
+        # gpu (exit point — logits come from the last layer's device).
         target_gpu0 = "cuda:0"
-        for name in ("embed_tokens",):
-            mod = getattr(model.model, name, None)
-            if mod is not None:
-                mod.to(target_gpu0)
+        embed = getattr(model.model, "embed_tokens", None)
+        if embed is not None:
+            embed.to(target_gpu0)
+        last_gpu = n_gpus - 1
+        target_last = f"cuda:{last_gpu}"
         if hasattr(model, "lm_head") and model.lm_head is not None:
-            model.lm_head.to(target_gpu0)
+            model.lm_head.to(target_last)
+        if hasattr(model.model, "norm"):
+            model.model.norm.to(target_last)
 
         offload_layers = 0
+        layer_devices: list[int] = []
         for i, layer in enumerate(layers):
             gpu_id = 0 if i < split else 1
             target = f"cuda:{gpu_id}"
+            layer_devices.append(gpu_id)
             # Move the layer to the GPU, then push experts back to CPU.
             layer.to(target)
             experts = getattr(layer.mlp, "experts", None)
@@ -323,11 +329,15 @@ class ModelManager:
                     p.data = p.data.to("cpu")
                 self._install_expert_hooks_on_module(experts, gpu_id)
                 offload_layers += 1
+            # Cross-GPU bridge: when the layer's output flows to the next layer
+            # on a different GPU, activations must hop across. accelerate does
+            # this via hooks with device_map="auto"; we replicate it manually.
+            self._install_layer_device_bridge(layer, gpu_id)
 
-        # Move the final model.norm to the last GPU used (exit point).
-        if hasattr(model.model, "norm"):
-            last_gpu = n_gpus - 1
-            model.model.norm.to(f"cuda:{last_gpu}")
+        # The final model.norm + lm_head were already placed on the last GPU
+        # above (exit point). The per-layer pre-hook moves activations onto
+        # each layer's device, so the GPU0->GPU1 boundary at the layer split is
+        # bridged automatically.
 
         print(f"[manager] MoE offload placed: layers split across {n_gpus} GPUs, "
               f"{offload_layers} layers' experts on CPU", flush=True)
@@ -337,6 +347,35 @@ class ModelManager:
             "layer_split": f"0-{split-1} on gpu0, {split}-{n_layers-1} on gpu1",
             "offloaded_expert_layers": offload_layers,
         }
+
+    def _install_layer_device_bridge(self, layer, gpu_id):
+        """Pre-hook: move any incoming tensor args/buffers onto cuda:<gpu_id>.
+
+        This is what makes manual multi-GPU placement work without accelerate's
+        device_map hooks: each layer forces its inputs onto its own device, so
+        activations flow GPU0 -> GPU1 cleanly at the layer boundary.
+        """
+        import torch  # noqa: PLC0415
+
+        target = f"cuda:{gpu_id}"
+
+        def pre(_module, args, kwargs):
+            def _move(x):
+                if isinstance(x, torch.Tensor) and x.device.type == "cuda" \
+                        and str(x.device) != target:
+                    return x.to(target)
+                return x
+            new_args = []
+            for a in args:
+                if isinstance(a, tuple):
+                    new_args.append(tuple(_move(t) for t in a))
+                else:
+                    new_args.append(_move(a))
+            if kwargs:
+                kwargs = {k: _move(v) for k, v in kwargs.items()}
+            return tuple(new_args), kwargs
+
+        layer.register_forward_pre_hook(pre, with_kwargs=True)
 
     def _install_expert_hooks_on_module(self, experts_module, gpu_id):
         """Register forward pre/post hooks paging the expert tensors GPU<->CPU."""
