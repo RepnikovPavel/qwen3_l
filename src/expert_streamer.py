@@ -79,38 +79,38 @@ class ExpertOffloader:
         import os  # noqa: PLC0415
 
         n_gpus = torch.cuda.device_count() or 1
-        # Decide a home GPU for each layer: split in CONTIGUOUS halves
-        # (layers 0..N/2-1 on gpu0, N/2..N-1 on gpu1) — minimizes cross-GPU
-        # boundary crossings vs round-robin, and matches what device_map="auto"
-        # would do. The non-expert parts move to the home GPU; routed experts
-        # stay on CPU and page to it.
+        # Pin ALL decoder layers to a SINGLE gpu (gpu0). The shared rotary_emb
+        # produces cos/sin once and they're consumed by every layer's attention;
+        # splitting layers across GPUs breaks this (q*cos device mismatch) and
+        # a kwarg bridge can't reliably relocate them (they're unpacked inside
+        # the attention forward, not visible at the layer pre-hook). One GPU
+        # for the layer stack + rotary + embed + norm; the second GPU is simply
+        # unused for the MoE path (the bench uses it via parallel instances).
+        # Routed experts (27 GB) stay on CPU and page to gpu0 per forward.
         inner = getattr(self.model, "model", self.model)
         layers = list(getattr(inner, "layers", []))
         n_layers = len(layers)
-        split = (n_layers + n_gpus - 1) // n_gpus  # ceil — first half slightly bigger
+        home = "cuda:0"
+        home_gpu = 0
 
-        # Entry modules (embed_tokens) on GPU 0.
+        # Entry modules (embed_tokens) on the home GPU.
         if hasattr(inner, "embed_tokens") and inner.embed_tokens is not None:
-            inner.embed_tokens.to("cuda:0")
-        # rotary_emb shared across layers — keep on GPU 0 (layers are called in
-        # order; the activation hops to each layer's home GPU via the hook).
+            inner.embed_tokens.to(home)
+        # rotary_emb shared across layers — on the home GPU (same as layers).
         if hasattr(inner, "rotary_emb") and inner.rotary_emb is not None:
-            inner.rotary_emb.to("cuda:0")
-        # Exit modules (final norm, lm_head) on the last GPU.
-        last_gpu = n_gpus - 1
+            inner.rotary_emb.to(home)
+        # Exit modules (final norm, lm_head) on the home GPU too.
         if hasattr(inner, "norm") and inner.norm is not None:
-            inner.norm.to(f"cuda:{last_gpu}")
+            inner.norm.to(home)
         if hasattr(self.model, "lm_head") and self.model.lm_head is not None:
             try:
-                self.model.lm_head.to(f"cuda:{last_gpu}")
+                self.model.lm_head.to(home)
             except Exception:
                 pass
 
         total_offloaded = 0
         for idx, layer in enumerate(layers):
-            gpu = min(idx // split, n_gpus - 1)
-            home = f"cuda:{gpu}"
-            self._home_gpu[idx] = gpu
+            self._home_gpu[idx] = home_gpu
             # Move everything in this layer to the home GPU first...
             layer.to(home)
             # ...then push the routed-expert tensors back to CPU.
@@ -125,18 +125,13 @@ class ExpertOffloader:
                 post = experts.register_forward_hook(self._make_post_hook())
                 self._handles.append(pre)
                 self._handles.append(post)
-            # Install a pre-hook on the whole layer to bridge activations onto
-            # its home GPU (needed at the GPU0/GPU1 boundary; also moves the
-            # rotary cos/sin kwarg along with the activation).
-            layer.register_forward_pre_hook(self._make_layer_bridge(home),
-                                            with_kwargs=True)
+            # No cross-GPU bridge needed — all layers share one GPU.
 
-        for g in range(n_gpus):
-            torch.cuda.synchronize(f"cuda:{g}")
+        torch.cuda.synchronize(home)
         self._installed = True
-        print(f"[expert-offload] placed {n_layers} layers across {n_gpus} GPU(s); "
-              f"{total_offloaded/1024**3:.2f} GiB of routed experts on CPU",
-              flush=True)
+        print(f"[expert-offload] placed {n_layers} layers on {home}; "
+              f"{total_offloaded/1024**3:.2f} GiB of routed experts on CPU "
+              f"(paged per forward)", flush=True)
 
     def _make_pre_hook(self, home: str):
         """Page the expert tensors onto their home GPU before the module runs."""
