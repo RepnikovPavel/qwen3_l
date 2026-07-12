@@ -61,9 +61,17 @@ class LayerStreamer:
         """Monkeypatch inner_model.forward with our chunked streaming loop."""
         if self._orig_forward is not None:
             return  # already installed
+        import types  # noqa: PLC0415
+
         self._orig_forward = self.inner.forward
-        # Bind as a method so `self` inside refers to the LayerStreamer.
-        self.inner.forward = self._streamed_forward
+        streamer = self
+
+        # Bind as a real method on the instance: `self` (the inner model) is
+        # passed by Python as the first positional arg, matching inner_model.
+        def _forward(inner_model, *args, **kwargs):
+            return streamer._streamed_forward(inner_model, *args, **kwargs)
+
+        self.inner.forward = types.MethodType(_forward, self.inner)
         print(f"[streamer] patched {type(self.inner).__name__}.forward: "
               f"{len(self.layers)} layers, gpu={self.gpu}, chunk={self.chunk}",
               flush=True)
