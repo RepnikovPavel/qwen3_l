@@ -137,7 +137,7 @@ def api_models():
     return {"models": [
         {"id": m.id, "display_name": m.display_name,
          "moe": m.moe, "fp8": m.fp8,
-         "size_gb": round(m.size_bytes / 1024**3, 1),
+         "size_gb": round(m.size_bytes / 1e9, 1),
          "short_desc": m.short_desc}
         for m in list_models()
     ]}
@@ -162,16 +162,16 @@ def api_memory():
     """
     cur = MANAGER.current  # snapshot to avoid race with idle-watcher
     procs = MANAGER.gpu_processes()
-    ours_mib = sum(p["used_mib"] for p in procs if p["ours"])
-    other_mib = sum(p["used_mib"] for p in procs if not p["ours"])
+    ours_bytes = sum(p["used_bytes"] for p in procs if p["ours"])
+    other_bytes = sum(p["used_bytes"] for p in procs if not p["ours"])
     return {
         "vram": MANAGER.vram_summary(),
         "ram": MANAGER.ram_summary(),
         "loaded": cur is not None,
         "model_id": cur.spec.id if cur is not None else None,
         "processes": procs,
-        "ours_vram_mib": round(ours_mib, 1),
-        "other_vram_mib": round(other_mib, 1),
+        "ours_vram_bytes": ours_bytes,
+        "other_vram_bytes": other_bytes,
     }
 
 

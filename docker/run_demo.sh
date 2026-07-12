@@ -32,7 +32,7 @@ fi
 echo "→ launching demo on 0.0.0.0:$PORT  (DEMO_DEVICE=${DEMO_DEVICE:-mp})"
 echo "→ access via: ssh -L ${PORT}:localhost:${PORT} tuna-server  →  http://localhost:${PORT}"
 
-docker run --rm \
+docker run -d --rm \
     --name "$CONTAINER_NAME" \
     --runtime=nvidia \
     --gpus all \
@@ -54,3 +54,6 @@ docker run --rm \
     --mount type=bind,src="$CKPTDIR",target="$CKPTDIR" \
     "$IMG_NAME" \
     python3 -m demo.server
+
+echo "✅ Demo started: docker logs -f $CONTAINER_NAME"
+echo "   http://localhost:$PORT  (or ssh -L ${PORT}:localhost:${PORT} ...)"

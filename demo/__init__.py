@@ -62,9 +62,7 @@ def split_thinking(text: str, saw_think_end: bool) -> tuple[str, str]:
     return text, ""
 
 
-def fmt_bytes(n: int) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(n) < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PiB"
+def fmt_bytes(n: int | float) -> str:
+    from src.human_size import fmt_bytes as _fmt  # noqa: PLC0415
+
+    return _fmt(n)

@@ -38,11 +38,9 @@ from src.models import get_model  # noqa: E402
 
 
 def _fmt_bytes(n: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(n) < 1024:
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return f"{n:.2f} PiB"
+    from src.human_size import fmt_bytes  # noqa: PLC0415
+
+    return fmt_bytes(n)
 
 
 def _fmt_num(n: int) -> str:
@@ -110,8 +108,7 @@ def cmd_inspect(args):
     print("  KV-cache vs context size    :")
     for ctx in (512, 2048, 8192, 32768, 131072, max_pos):
         if ctx <= max_pos:
-            mb = kv_per_token * ctx / 1024**2
-            print(f"    {ctx:>7} tokens -> {mb:>10.1f} MiB")
+            print(f"    {ctx:>7} tokens -> {_fmt_bytes(kv_per_token * ctx):>12}")
 
     # ----- Weight sizes per component --------------------------------------
     print("\n[WEIGHTS per decoder layer]")
@@ -370,7 +367,7 @@ def _bench_context_transfer(model, cfg, args):
     n_gpus = torch.cuda.device_count()
     has_2gpu = n_gpus >= 2
 
-    print(f"  {'ctx':>6} | {'KV MiB':>9} | {'GPU0->CPU':>10}"
+    print(f"  {'ctx':>6} | {'KV size':>10} | {'GPU0->CPU':>10}"
           + (f" | {'GPU0->GPU1':>11}" if has_2gpu else "")
           + f" | {'CPU->GPU0':>10}")
     print("  " + "-" * (60 if has_2gpu else 48))
@@ -409,8 +406,7 @@ def _bench_context_transfer(model, cfg, args):
         torch.cuda.synchronize()
         c2g_ms = (time.perf_counter() - t0) / args.runs * 1000
 
-        mib = total_bytes / 1024**2
-        row = (f"  {ctx:>6} | {mib:>9.1f} | {g2c_ms:>10.2f}")
+        row = (f"  {ctx:>6} | {_fmt_bytes(total_bytes):>10} | {g2c_ms:>10.2f}")
         if has_2gpu:
             row += f" | {g2g_ms:>11.2f}"
         row += f" | {c2g_ms:>10.2f}"

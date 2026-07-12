@@ -185,19 +185,21 @@ class ExpertOffloader:
             torch.cuda.synchronize(gpu)
 
         self._installed = True
-        cap_mib = self._cache_gib * 1024
+        from src.human_size import fmt_bytes  # noqa: PLC0415
+
+        cache_bytes = int(self._cache_gib * 1024**3)
         mode = f"split {placement_counts}" if split else "single cuda:0"
         paging = "slice-LRU" if self._slice_mode else "layer-LRU"
         if self._slice_mode and slice_bytes:
-            n_fit = int(cap_mib * 1024**2 // slice_bytes)
+            n_fit = int(cache_bytes // slice_bytes)
             unit = f"~{n_fit} expert-slices/GPU"
         else:
             min_mod = min(self._module_size.values()) if self._module_size else 1
-            n_fit = int(cap_mib // (min_mod / 1024**2))
+            n_fit = int(cache_bytes // min_mod) if min_mod else 0
             unit = f"~{n_fit} modules/GPU"
         print(f"[expert-offload] {n_layers} layers, mode={mode}, paging={paging}; "
-              f"{total_offloaded/1024**3:.2f} GiB routed experts on CPU "
-              f"(pinned DMA). Per-GPU cache: {cap_mib:.0f} MiB ({unit})",
+              f"{fmt_bytes(total_offloaded)} routed experts on CPU "
+              f"(pinned DMA). Per-GPU cache: {fmt_bytes(cache_bytes)} ({unit})",
               flush=True)
 
     # ---- slice LRU ---------------------------------------------------------

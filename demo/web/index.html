@@ -57,8 +57,9 @@
   /* Thinking stream: scrollable list of chunk-cards like chat messages.
      min-height:0 is REQUIRED so flex can shrink it inside .col (otherwise the
      content pushes the ctx/vram panels off-screen — the bug from the screenshot). */
-  .thinking-stream{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px;display:flex;flex-direction:column;gap:8px;min-height:0;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55}
-  .think-chunk{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--think);border-radius:6px;padding:8px 10px;color:var(--think);white-space:pre-wrap;word-break:break-word;animation:fadein .25s ease}
+  .thinking-stream{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0;font-size:13px;line-height:1.6}
+  .think-chunk{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--think);border-radius:6px;padding:10px 12px;color:var(--text);white-space:pre-wrap;word-break:break-word}
+  .think-chunk:last-child{border-left-color:var(--think);color:var(--think)}
   @keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
   .thinking-empty{color:var(--muted);font-style:italic;font-family:inherit;padding:14px}
   .ctx-panel,.vram-panel{padding:10px 14px;border-top:1px solid var(--border);background:var(--panel);flex-shrink:0}
@@ -158,7 +159,8 @@
 const $=id=>document.getElementById(id);
 let currentSession=null, kvBytesPerToken=0, activeReader=null, activeAbort=null;
 const LS_KEY='qwen3_demo_session';
-const fmtB=n=>{const u=['B','KiB','MiB','GiB','TiB','PiB'];let i=0;while(Math.abs(n)>=1024&&i<u.length-1){n/=1024;i++;}return n.toFixed(1)+' '+u[i];};
+const fmtB=n=>{const u=['B','KB','MB','GB','TB'];let i=0,nf=Number(n);while(Math.abs(nf)>=1000&&i<u.length-1){nf/=1000;i++;}return(i===0?Math.round(nf):nf.toFixed(1))+' '+u[i];};
+const fmtBytes=fmtB;
 function showError(t){const e=$('err');e.textContent=t;e.style.display=t?'block':'none';}
 function setOverlay(on,text){$('overlay').style.display=on?'flex':'none';if(text)$('overlay-text').textContent=text;}
 
@@ -211,38 +213,36 @@ function renderVram(gpus){
   if(!gpus||!gpus.length){box.innerHTML='<div class="gpu-row">нет GPU</div>';return;}
   if(gpus[0].error){box.innerHTML=`<div class="gpu-row">${gpus[0].error}</div>`;return;}
   for(const g of gpus){
-    const pct=g.total_mib?(g.used_mib/g.total_mib*100):0;
+    const pct=g.total_bytes?(g.used_bytes/g.total_bytes*100):0;
     const row=document.createElement('div');
-    row.innerHTML=`<div class="gpu-row"><span>GPU${g.gpu} · ${g.name}</span><span><b>${g.used_mib.toFixed(0)}</b> / ${g.total_mib.toFixed(0)} MiB · free ${g.free_mib.toFixed(0)}</span></div>
+    row.innerHTML=`<div class="gpu-row"><span>GPU${g.gpu} · ${g.name}</span><span><b>${fmtBytes(g.used_bytes)}</b> / ${fmtBytes(g.total_bytes)} · свободно ${fmtBytes(g.free_bytes)}</span></div>
       <div class="bar vram"><div style="width:${pct.toFixed(1)}%"></div></div>`;
     box.appendChild(row);
   }
 }
-
-const fmtMiB=m=>m>=1024?(m/1024).toFixed(2)+' GiB':m.toFixed(0)+' MiB';
 async function refreshMemory(){
   try{
     const r=await fetch('/api/memory');const d=await r.json();
     renderVram(d.vram||[]);
     const ram=d.ram||{};
-    $('mem-vram').textContent=fmtMiB(ram.vram_used_mib||0)+' / '+fmtMiB(ram.vram_total_mib||0);
-    $('mem-rss').textContent=fmtMiB(ram.rss_mib||0);
-    $('mem-total').textContent='VRAM '+(ram.vram_used_mib?fmtMiB(ram.vram_used_mib):'—')+' + RSS '+(ram.rss_mib?fmtMiB(ram.rss_mib):'—');
+    $('mem-vram').textContent=fmtBytes(ram.vram_used_bytes||0)+' / '+fmtBytes(ram.vram_total_bytes||0);
+    $('mem-rss').textContent=fmtBytes(ram.rss_bytes||0);
+    $('mem-total').textContent='VRAM '+(ram.vram_used_bytes?fmtBytes(ram.vram_used_bytes):'—')+' + RAM '+(ram.rss_bytes?fmtBytes(ram.rss_bytes):'—');
     $('mem-model').textContent=d.loaded?('модель: '+d.model_id):'модель не загружена';
     // Process breakdown: ours vs other (show in the gpu list footer).
-    const ours=d.ours_vram_mib||0, other=d.other_vram_mib||0;
+    const ours=d.ours_vram_bytes||0, other=d.other_vram_bytes||0;
     let procsBox=$('mem-procs');
     if(!procsBox){
       procsBox=document.createElement('div');procsBox.id='mem-procs';
       $('vram-gpus').parentNode.insertBefore(procsBox,$('vram-gpus').nextSibling);
     }
-    const rows=(d.processes||[]).slice().sort((a,b)=>b.used_mib-a.used_mib);
-    let html=`<div class="ctx-row" style="margin-top:6px"><span style="color:var(--accent2)">▼ мы (демка): <b>${fmtMiB(ours)}</b></span><span style="color:var(--warn)">▼ другие: <b>${fmtMiB(other)}</b></span></div>`;
+    const rows=(d.processes||[]).slice().sort((a,b)=>b.used_bytes-a.used_bytes);
+    let html=`<div class="ctx-row" style="margin-top:6px"><span style="color:var(--accent2)">▼ мы (демка): <b>${fmtBytes(ours)}</b></span><span style="color:var(--warn)">▼ другие: <b>${fmtBytes(other)}</b></span></div>`;
     for(const p of rows){
       const color=p.ours?'var(--accent2)':'var(--warn)';
       const tag=p.ours?'[наш]':'[чужой]';
       const cmd=p.cmd?p.cmd.slice(0,70):'';
-      html+=`<div class="gpu-row" style="font-size:10px;color:${color}"><span>${tag} PID ${p.pid} · GPU${p.gpu}</span><span><b>${p.used_mib.toFixed(0)} MiB</b></span></div>`;
+      html+=`<div class="gpu-row" style="font-size:10px;color:${color}"><span>${tag} PID ${p.pid} · GPU${p.gpu}</span><span><b>${fmtBytes(p.used_bytes)}</b></span></div>`;
       if(cmd)html+=`<div class="gpu-row" style="font-size:9px;color:var(--muted);margin-top:-2px"><span colspan="2" style="word-break:break-all">${cmd}</span></div>`;
     }
     procsBox.innerHTML=html;
@@ -332,9 +332,9 @@ async function doUnload(){
     await new Promise(r=>setTimeout(r,1500));
     const after=await fetch('/api/memory').then(r=>r.json());
     const fb=before.ram||{}, fa=after.ram||{};
-    const freedVram=((fb.vram_used_mib||0)-(fa.vram_used_mib||0));
-    const freedRss=((fb.rss_mib||0)-(fa.rss_mib||0));
-    const msg=`Освобождено: VRAM ${fmtMiB(Math.max(0,freedVram))}, RAM ${fmtMiB(Math.max(0,freedRss))}. Модель выгружена, сессии сохранены.`;
+    const freedVram=((fb.vram_used_bytes||0)-(fa.vram_used_bytes||0));
+    const freedRss=((fb.rss_bytes||0)-(fa.rss_bytes||0));
+    const msg=`Освобождено: VRAM ${fmtBytes(Math.max(0,freedVram))}, RAM ${fmtBytes(Math.max(0,freedRss))}. Модель выгружена, сессии сохранены.`;
     $('msgs').innerHTML='';$('thinking').innerHTML='<span class="thinking-empty">модель выгружена (контекст сброшен, сессии в SQLite сохранены)</span>';
     setOverlay(false);showError(msg);
   }catch(e){setOverlay(false);showError(e);}
@@ -367,30 +367,43 @@ function handleFrame(line,state){
   else if(obj.type==='error')showError(obj.message);
 }
 
-function appendThinkChunk(text, state){
+function splitThinkingDisplay(text){
+  if(!text)return[];
+  if(/\n\n/.test(text)){
+    const parts=text.split(/\n\n+/);
+    return parts.map((p,i)=>i<parts.length-1?p+'\n\n':p).filter(p=>p.trim().length>0);
+  }
+  const chunks=[];
+  const re=/[^.!?…\n]*[.!?…]+(?:\s+|\n+|$)/g;
+  let m,last=0;
+  while((m=re.exec(text))!==null){
+    if(m[0].trim())chunks.push(m[0]);
+    last=re.lastIndex;
+  }
+  const tail=text.slice(last);
+  if(tail)chunks.push(tail);
+  return chunks.length?chunks:[text];
+}
+function renderThinkingStream(box,state){
+  const chunks=splitThinkingDisplay(state.thinkBuf||'');
+  box.innerHTML='';
+  for(const c of chunks){
+    const card=document.createElement('div');
+    card.className='think-chunk';
+    card.textContent=c.trimEnd();
+    box.appendChild(card);
+  }
+  box.scrollTop=box.scrollHeight;
+}
+function appendThinkChunk(text,state){
   const box=$('thinking');
-  // Remove the "empty" placeholder on first chunk.
   if(state.firstThink===undefined){
     box.innerHTML='';
     state.firstThink=true;
-    state.lastChunk=null;
-    state.chunkBuf='';
-    state.chunkTimer=null;
+    state.thinkBuf='';
   }
-  // Buffer tokens ~120ms or ~40 chars before flushing a card, so we get
-  // readable chunks instead of one card per token.
-  state.chunkBuf+=text;
-  if(state.chunkTimer)clearTimeout(state.chunkTimer);
-  state.chunkTimer=setTimeout(()=>{
-    const t=state.chunkBuf;state.chunkBuf='';
-    if(!t)return;
-    const card=document.createElement('div');
-    card.className='think-chunk';
-    card.textContent=t;
-    box.appendChild(card);
-    box.scrollTop=box.scrollHeight;
-    state.lastChunk=card;
-  },120);
+  state.thinkBuf+=text;
+  renderThinkingStream(box,state);
 }
 
 async function attachStream(sessionId){

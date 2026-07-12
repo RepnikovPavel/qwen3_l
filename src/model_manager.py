@@ -9,7 +9,7 @@ provides:
   - unload()                       — free the current model + reclaim VRAM.
   - get_or_load(...)               — lazy: load on first use; auto-unload after
                                      IDLE_TIMEOUT seconds of inactivity.
-  - vram_summary()                 — per-GPU used/free MiB for the UI.
+  - vram_summary()                 — per-GPU used/free bytes for the UI.
   - reset_context()                — drop the conversation history (cheap).
 
 The manager is process-global (one model loaded at a time) because the GPUs are
@@ -139,7 +139,7 @@ class ModelManager:
                 self._loaded.last_used = time.time()
 
     def vram_summary(self) -> list[dict]:
-        """Per-GPU memory snapshot for the UI."""
+        """Per-GPU memory snapshot for the UI (sizes in bytes)."""
         try:
             import torch  # noqa: PLC0415
             if not torch.cuda.is_available():
@@ -151,9 +151,9 @@ class ModelManager:
                 out.append({
                     "gpu": i,
                     "name": torch.cuda.get_device_name(i),
-                    "total_mib": round(total / 1024**2, 1),
-                    "used_mib": round(used / 1024**2, 1),
-                    "free_mib": round(free / 1024**2, 1),
+                    "total_bytes": int(total),
+                    "used_bytes": int(used),
+                    "free_bytes": int(free),
                 })
             return out
         except Exception as e:  # noqa: BLE001
@@ -199,8 +199,9 @@ class ModelManager:
             uuid, pid_s, name, mem_s = parts[:4]
             try:
                 pid = int(pid_s)
-                # used_memory comes as "1234 MiB" — strip unit.
+                from src.human_size import mib_to_bytes  # noqa: PLC0415
                 mem_mib = float(mem_s.replace("MiB", "").strip())
+                mem_bytes = mib_to_bytes(mem_mib)
             except ValueError:
                 continue
             gpu_idx = idx_to_uuid.get(uuid, -1)
@@ -216,7 +217,7 @@ class ModelManager:
             procs.append({
                 "pid": pid,
                 "gpu": gpu_idx,
-                "used_mib": mem_mib,
+                "used_bytes": mem_bytes,
                 "ours": pid == our_pid,
                 "cmd": cmd,
             })
@@ -227,19 +228,19 @@ class ModelManager:
         try:
             import resource  # noqa: PLC0415
             rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            rss_mib = rss_kb / 1024.0  # Linux reports KiB
+            rss_bytes = int(rss_kb * 1024)  # Linux ru_maxrss is KiB
         except Exception:
-            rss_mib = 0.0
-        vram_total_mib = 0.0
-        vram_used_mib = 0.0
+            rss_bytes = 0
+        vram_total_bytes = 0
+        vram_used_bytes = 0
         for g in self.vram_summary():
             if "error" not in g:
-                vram_total_mib += g["total_mib"]
-                vram_used_mib += g["used_mib"]
+                vram_total_bytes += g["total_bytes"]
+                vram_used_bytes += g["used_bytes"]
         return {
-            "rss_mib": round(rss_mib, 1),
-            "vram_total_mib": round(vram_total_mib, 1),
-            "vram_used_mib": round(vram_used_mib, 1),
+            "rss_bytes": rss_bytes,
+            "vram_total_bytes": vram_total_bytes,
+            "vram_used_bytes": vram_used_bytes,
         }
 
 
@@ -500,5 +501,9 @@ class ModelManager:
     def _log_vram(self, tag: str):
         v = self.vram_summary()
         if v and "error" not in v[0]:
-            parts = [f"GPU{g['gpu']}: {g['used_mib']}/{g['total_mib']} MiB" for g in v]
+            from src.human_size import fmt_bytes  # noqa: PLC0415
+            parts = [
+                f"GPU{g['gpu']}: {fmt_bytes(g['used_bytes'])}/{fmt_bytes(g['total_bytes'])}"
+                for g in v
+            ]
             print(f"[vram {tag}] " + " | ".join(parts), flush=True)
