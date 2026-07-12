@@ -326,20 +326,28 @@ def _bench_layer_forward(layer, model, cfg, args):
         finally:
             layer.to("cpu"); torch.cuda.empty_cache()
 
-        # --- CPU ---
-        try:
-            layer.to(cpu_dev)
-            hs, pos = make_inputs(ctx, cpu_dev)
-            pos_emb = rotary(hs, pos) if rotary else None
-            with torch.no_grad():
-                for _ in range(max(1, args.warmup // 4)):
-                    layer(hs, position_ids=pos, position_embeddings=pos_emb)
-                t0 = time.perf_counter()
-                for _ in range(max(1, args.runs // 4)):
-                    layer(hs, position_ids=pos, position_embeddings=pos_emb)
-                cpu_ms = (time.perf_counter() - t0) / max(1, args.runs // 4) * 1000
-        except Exception as e:
-            cpu_ms = float("nan")
+        # --- CPU --- (skip for MoE FP8: FP8Experts.linear needs CUDA Triton kernel)
+        is_moe_fp8 = (
+            getattr(cfg, "model_type", "").endswith("_moe")
+            and hasattr(layer, "mlp")
+            and hasattr(getattr(layer.mlp, "experts", None), "linear")
+        )
+        if is_moe_fp8:
+            cpu_ms = float("nan")  # N/A — not meaningful without GPU FP8 path
+        else:
+            try:
+                layer.to(cpu_dev)
+                hs, pos = make_inputs(ctx, cpu_dev)
+                pos_emb = rotary(hs, pos) if rotary else None
+                with torch.no_grad():
+                    for _ in range(max(1, args.warmup // 4)):
+                        layer(hs, position_ids=pos, position_embeddings=pos_emb)
+                    t0 = time.perf_counter()
+                    for _ in range(max(1, args.runs // 4)):
+                        layer(hs, position_ids=pos, position_embeddings=pos_emb)
+                    cpu_ms = (time.perf_counter() - t0) / max(1, args.runs // 4) * 1000
+            except Exception:
+                cpu_ms = float("nan")
 
         print(f"  {ctx:>6} | {gpu_ms:>10.2f} | {cpu_ms:>10.2f}")
 

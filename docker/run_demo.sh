@@ -47,6 +47,9 @@ docker run --rm \
     -e DEMO_DEVICE="${DEMO_DEVICE:-mp}" \
     -e DEMO_GPU_ID="${DEMO_GPU_ID:-0}" \
     -e DEMO_MP_MAX_MEMORY="${DEMO_MP_MAX_MEMORY:-}" \
+    -e DEMO_EXPERT_SLICE_MODE="${DEMO_EXPERT_SLICE_MODE:-1}" \
+    -e DEMO_EXPERT_SPLIT_GPU="${DEMO_EXPERT_SPLIT_GPU:-1}" \
+    -e DEMO_EXPERT_CACHE_GIB="${DEMO_EXPERT_CACHE_GIB:-11}" \
     -e PORT="$PORT" \
     --mount type=bind,src="$CKPTDIR",target="$CKPTDIR" \
     "$IMG_NAME" \
