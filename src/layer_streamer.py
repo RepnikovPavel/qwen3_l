@@ -87,9 +87,11 @@ class LayerStreamer:
                 pass
 
         # Install a pre-hook on each layer that pages it in + prefetches ahead.
+        # with_kwargs=True so we can inspect/move kwargs tensors too.
         for i, layer in enumerate(layers):
             hook = layer.register_forward_pre_hook(
-                lambda _mod, _args, idx=i: streamer._page_in(idx)
+                lambda _mod, args, kwargs, idx=i: streamer._page_in(idx, args, kwargs),
+                with_kwargs=True,
             )
             streamer._hooks.append(hook)
         # Install post-hook on the LAST layer to kick off wrap-around prefetch
@@ -127,43 +129,63 @@ class LayerStreamer:
             self._prefetch_threads[idx] = t
             t.start()
 
-    def _page_in(self, idx: int):
+    def _page_in(self, idx: int, args=(), kwargs=None):
         """Called right before layer idx's forward: ensure it's on its home GPU,
-        then start prefetching the next layers, and evict old ones back to CPU."""
-        # 1. Wait for this layer's prefetch to finish (it was kicked off earlier).
+        move the INPUT activations onto that GPU too, then prefetch ahead and
+        evict old layers back to CPU."""
+        # 1. Wait for this layer's prefetch to finish (kicked off earlier).
         with self._lock:
             t = self._prefetch_threads.get(idx)
         if t is not None:
             t.join()
             with self._lock:
                 self._prefetch_threads.pop(idx, None)
-        # Make sure it really is on the home GPU (synchronous backstop).
+        # Make sure the layer really is on its home GPU (sync backstop).
         gpu = self.home_gpu[idx]
+        target = f"cuda:{gpu}"
         layer = self.layers[idx]
         try:
             p0 = next(layer.parameters())
-            if str(p0.device) != f"cuda:{gpu}":
-                layer.to(f"cuda:{gpu}", non_blocking=False)
+            if str(p0.device) != target:
+                layer.to(target, non_blocking=False)
         except StopIteration:
             pass
 
-        # 2. Prefetch the next `chunk` layers ahead of time.
+        # 2. Bridge: move input activation tensors onto this layer's GPU so
+        #    weight and input agree (otherwise RMSNorm/Linear raise device
+        #    mismatch). This also handles the GPU0->GPU1 hop at boundaries.
+        new_args = []
+        for a in args:
+            if isinstance(a, torch.Tensor) and a.device.type == "cuda" \
+                    and str(a.device) != target:
+                new_args.append(a.to(target, non_blocking=True))
+            elif isinstance(a, tuple):
+                new_args.append(tuple(
+                    (t.to(target, non_blocking=True) if isinstance(t, torch.Tensor)
+                     and t.device.type == "cuda" and str(t.device) != target else t)
+                    for t in a
+                ))
+            else:
+                new_args.append(a)
+        args = tuple(new_args)
+
+        # 3. Prefetch the next `chunk` layers ahead of time.
         for k in range(1, self.chunk + 1):
             self._start_prefetch(idx + k)
 
-        # 3. Evict layers we're done with (more than `chunk` behind) back to CPU.
+        # 4. Evict layers we're done with (more than `chunk` behind) to CPU.
         evict_idx = idx - self.chunk
         if evict_idx >= 0:
             old = self.layers[evict_idx]
-            # non_blocking copy on a side CPU stream; no need to wait.
             try:
                 p = next(old.parameters())
                 if p.device.type == "cuda":
-                    threading.Thread(
-                        target=_move_async, args=(old, "cpu")
-                    ).start()
+                    threading.Thread(target=_move_async, args=(old, "cpu")).start()
             except StopIteration:
                 pass
+
+        # We mutated args in place (pre-hook returns the new args via this).
+        return args, (kwargs or {})
 
     def home_device_for_inputs(self):
         """Device where embed_tokens lives — where input_ids should be placed."""
