@@ -424,24 +424,7 @@ def chat(req: ChatRequest, request: Request):
     )
     worker.start()
 
-    def event_stream():
-        # On client disconnect, request.close() triggers; we keep generating.
-        # Use the request's is_disconnected() to stop streaming to THIS client,
-        # but the background thread keeps running.
-        try:
-            for frame in gen.iter_frames(0):
-                if await request.is_disconnected():
-                    break
-                yield frame
-        except Exception:
-            pass
-        finally:
-            # If the generation is done, clean up the registry.
-            if gen.done:
-                with GEN_LOCK:
-                    GENERATIONS.pop(req.session_id, None)
-
-    # NOTE: this generator must be async to use `await request.is_disconnected()`.
+    # NOTE: the stream must be async to use `await request.is_disconnected()`.
     async def aevent_stream():
         for frame in gen.iter_frames(0):
             if await request.is_disconnected():
