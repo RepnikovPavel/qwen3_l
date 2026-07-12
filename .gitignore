@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Model weights / HF cache (downloaded at runtime, never committed)
+checkpoints/
+*.safetensors
+models--*/
+
+# Benchmark outputs
+bench/results/
+*.json.bench
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

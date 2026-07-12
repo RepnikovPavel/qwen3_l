@@ -1,0 +1,6 @@
+# Python deps for HOST-side use (not needed inside the trtllm container, which
+# already ships torch + transformers + triton). Listed for completeness /
+# running directly on a workstation.
+transformers>=4.57.6
+accelerate
+torch

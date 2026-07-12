@@ -1,0 +1,10 @@
+{
+  "name": "finegrained-fp8",
+  "id": "_finegrained_fp8_cuda_7c5619e",
+  "version": 1,
+  "license": "Apache-2.0",
+  "python-depends": [],
+  "backend": {
+    "type": "cuda"
+  }
+}
