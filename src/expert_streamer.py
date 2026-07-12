@@ -264,10 +264,6 @@ class ExpertOffloader:
                                     if p.device.type == "cpu":
                                         p.data = p.data.to("cuda:0",
                                             non_blocking=True)
-                                # Note: the pre-hook will record it as resident.
-                                # We can't easily mark it here without racing,
-                                # so the pre-hook re-checks device and records.
-                            break
             return output
 
         return hook
