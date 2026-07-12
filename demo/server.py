@@ -240,6 +240,8 @@ def chat(req: ChatRequest):
             yield sse({"type": "error", "message": f"{type(e).__name__}: {e}",
                        "traceback": traceback.format_exc()})
 
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
     import uvicorn  # noqa: PLC0415
